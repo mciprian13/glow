@@ -195,9 +195,22 @@ public:
     return outputVarsByName_.begin()->second;
   }
 
+  /// \returns the single input of the network. The function assumes that there
+  /// is only one input, returns Error otherwise. For most of the models the
+  /// single input is usually an image tensor.
+  Expected<Placeholder *> getSingleInput() {
+    RETURN_ERR_IF_NOT(inputVarsByName_.size() == 1,
+                      "There must be only one input.");
+    return inputVarsByName_.begin()->second;
+  }
+
   /// \returns the Placeholder for the external output with \p name.
   /// \pre outputVarsByName_.find(name) != outputVarsByName_.end()
   Expected<Placeholder *> getOutputByName(llvm::StringRef name) const;
+
+  /// \returns the Placeholder for the external input with \p name.
+  /// \pre inputVarsByName_.find(name) != inputVarsByName_.end()
+  Expected<Placeholder *> getInputByName(llvm::StringRef name) const;
 
   /// \returns True if the operator with name \p typeName having input node
   /// list as \p inputs is constant foldable.
