@@ -532,12 +532,9 @@ TEST_F(OnnxImporterTest, leakyRelu) {
   }
 
   auto *save = getSaveNodeFromDest(output);
-  PReluNode *PRL = llvm::dyn_cast<PReluNode>(save->getInput().getNode());
-  ASSERT_TRUE(PRL);
-  NodeValue slopeN = PRL->getSlope();
-  SplatNode *splatN = llvm::dyn_cast<SplatNode>(slopeN.getNode());
-  ASSERT_TRUE(splatN);
-  EXPECT_FLOAT_EQ(splatN->getValue(), 0.100000001);
+  LeakyReluNode *LR = llvm::dyn_cast<LeakyReluNode>(save->getInput().getNode());
+  ASSERT_TRUE(LR);
+  EXPECT_FLOAT_EQ(LR->getAlpha(), 0.100000001);
 }
 
 /// Test Loading LeakyRelu op from an ONNX model with default alpha.
@@ -560,12 +557,9 @@ TEST_F(OnnxImporterTest, leakyReluDefault) {
   }
 
   auto *save = getSaveNodeFromDest(output);
-  PReluNode *PRL = llvm::dyn_cast<PReluNode>(save->getInput().getNode());
-  ASSERT_TRUE(PRL);
-  NodeValue slopeN = PRL->getSlope();
-  SplatNode *splatN = llvm::dyn_cast<SplatNode>(slopeN.getNode());
-  ASSERT_TRUE(splatN);
-  EXPECT_FLOAT_EQ(splatN->getValue(), 0.01);
+  LeakyReluNode *LR = llvm::dyn_cast<LeakyReluNode>(save->getInput().getNode());
+  ASSERT_TRUE(LR);
+  EXPECT_FLOAT_EQ(LR->getAlpha(), 0.01);
 }
 
 TEST_F(OnnxImporterTest, importAddMultiBroadcastOp7) {
@@ -1400,6 +1394,17 @@ TEST_F(OnnxImporterTest, importAveragePool2DAutoPadSameLower) {
   std::string filename("averagePool2DAutoPadSameLower.onnxtxt");
   std::vector<dim_t> expectedDims = {1, 1, 3, 3};
   std::vector<float> expectedValues = {0, 0.25, 0.75, 0.75, 2, 3, 2.25, 5, 6};
+  averagePoolTestHelper(filename, expectedDims, expectedValues);
+}
+
+/// Test loading AveragePool op from a ONNX model.
+/// The input is N*C*H*W (1*1*3*3), the kernels is {3, 3},
+/// strides is {2, 2}, pads is {1, 1, 1, 1},
+/// countIncludePads is false.
+TEST_F(OnnxImporterTest, importAveragePool2DCountExcludePads) {
+  std::string filename("averagePool2DCountExcludePads.onnxtxt");
+  std::vector<dim_t> expectedDims = {1, 1, 2, 2};
+  std::vector<float> expectedValues = {2, 3, 5, 6};
   averagePoolTestHelper(filename, expectedDims, expectedValues);
 }
 
@@ -2856,21 +2861,22 @@ TEST_F(OnnxImporterTest, topK) {
       checkConstFoldedOutput(netFilename, {"scores"}, {&x}, {outputT, indexT}));
 }
 
-TEST_F(OnnxImporterTest, argMaxKeepDim) {
+void testArgMinMax(llvm::StringRef filename, bool isMin,
+                   const std::vector<dim_t> &expectedDims) {
   ExecutionEngine EE;
   auto &mod = EE.getModule();
   Function *F = mod.createFunction("main");
 
-  std::string netFilename(GLOW_DATA_PATH
-                          "tests/models/onnxModels/ArgMaxKeepDim.onnxtxt");
+  std::string netFilename = std::string(GLOW_DATA_PATH) + filename.str();
 
   PlaceholderBindings bindings;
-  Placeholder *argmaxPH;
+  Placeholder *PH;
+  std::vector<dim_t> inDims = {2, 3, 4, 5};
   {
-    Tensor inT(ElemKind::FloatTy, {2, 3, 4, 5});
+    Tensor inT(ElemKind::FloatTy, inDims);
 
     ONNXModelLoader onnxLD(netFilename, {"input"}, {&inT.getType()}, *F);
-    argmaxPH = EXIT_ON_ERR(onnxLD.getOutputByName("argmax_scores"));
+    PH = EXIT_ON_ERR(onnxLD.getOutputByName("scores"));
     bindings.allocate(mod.getPlaceholders());
     updateInputPlaceholdersByName(bindings, &mod, {"input"}, {&inT});
   }
@@ -2878,63 +2884,45 @@ TEST_F(OnnxImporterTest, argMaxKeepDim) {
   EE.compile(CompilationMode::Infer);
   EE.run(bindings);
 
-  auto argmax = bindings.get(argmaxPH)->getHandle<int64_t>();
-  std::vector<dim_t> expectedDims = {2, 3, 1, 5};
-  EXPECT_TRUE(argmax.dims().vec() == expectedDims);
+  auto output = bindings.get(PH)->getHandle<int64_t>();
+  EXPECT_TRUE(output.dims().vec() == expectedDims);
+
+  auto *save = getSaveNodeFromDest(PH);
+  if (isMin) {
+    EXPECT_TRUE(llvm::isa<ArgMinNode>(save->getInput()));
+  } else {
+    EXPECT_TRUE(llvm::isa<ArgMaxNode>(save->getInput()));
+  }
+}
+
+TEST_F(OnnxImporterTest, argMaxKeepDim) {
+  testArgMinMax("tests/models/onnxModels/ArgMaxKeepDim.onnxtxt", false,
+                {2, 3, 1, 5});
 }
 
 TEST_F(OnnxImporterTest, argMaxNoKeepDim) {
-  ExecutionEngine EE;
-  auto &mod = EE.getModule();
-  Function *F = mod.createFunction("main");
-
-  std::string netFilename(GLOW_DATA_PATH
-                          "tests/models/onnxModels/ArgMaxNoKeepDim.onnxtxt");
-
-  PlaceholderBindings bindings;
-  Placeholder *argmaxPH;
-  {
-    Tensor inT(ElemKind::FloatTy, {2, 3, 4, 5});
-
-    ONNXModelLoader onnxLD(netFilename, {"input"}, {&inT.getType()}, *F);
-    argmaxPH = EXIT_ON_ERR(onnxLD.getOutputByName("argmax_scores"));
-    bindings.allocate(mod.getPlaceholders());
-    updateInputPlaceholdersByName(bindings, &mod, {"input"}, {&inT});
-  }
-
-  EE.compile(CompilationMode::Infer);
-  EE.run(bindings);
-
-  auto argmax = bindings.get(argmaxPH)->getHandle<int64_t>();
-  std::vector<dim_t> expectedDims = {2, 4, 5};
-  EXPECT_TRUE(argmax.dims().vec() == expectedDims);
+  testArgMinMax("tests/models/onnxModels/ArgMaxNoKeepDim.onnxtxt", false,
+                {2, 4, 5});
 }
 
 TEST_F(OnnxImporterTest, argMaxDefault) {
-  ExecutionEngine EE;
-  auto &mod = EE.getModule();
-  Function *F = mod.createFunction("main");
+  testArgMinMax("tests/models/onnxModels/ArgMaxDefault.onnxtxt", false,
+                {1, 3, 4, 5});
+}
 
-  std::string netFilename(GLOW_DATA_PATH
-                          "tests/models/onnxModels/ArgMaxDefault.onnxtxt");
+TEST_F(OnnxImporterTest, argMinKeepDim) {
+  testArgMinMax("tests/models/onnxModels/ArgMinKeepDim.onnxtxt", true,
+                {2, 3, 1, 5});
+}
 
-  PlaceholderBindings bindings;
-  Placeholder *argmaxPH;
-  {
-    Tensor inT(ElemKind::FloatTy, {2, 3, 4, 5});
+TEST_F(OnnxImporterTest, argMinNoKeepDim) {
+  testArgMinMax("tests/models/onnxModels/ArgMinNoKeepDim.onnxtxt", true,
+                {2, 4, 5});
+}
 
-    ONNXModelLoader onnxLD(netFilename, {"input"}, {&inT.getType()}, *F);
-    argmaxPH = EXIT_ON_ERR(onnxLD.getOutputByName("argmax_scores"));
-    bindings.allocate(mod.getPlaceholders());
-    updateInputPlaceholdersByName(bindings, &mod, {"input"}, {&inT});
-  }
-
-  EE.compile(CompilationMode::Infer);
-  EE.run(bindings);
-
-  auto argmax = bindings.get(argmaxPH)->getHandle<int64_t>();
-  std::vector<dim_t> expectedDims = {1, 3, 4, 5};
-  EXPECT_TRUE(argmax.dims().vec() == expectedDims);
+TEST_F(OnnxImporterTest, argMinDefault) {
+  testArgMinMax("tests/models/onnxModels/ArgMinDefault.onnxtxt", true,
+                {1, 3, 4, 5});
 }
 
 TEST_F(OnnxImporterTest, importMaxPoolWithArgmax) {
@@ -3016,6 +3004,75 @@ TEST_F(OnnxImporterTest, importMaxPoolWithArgmax) {
   for (size_t i = 0; i < expectedResult.size(); i++) {
     EXPECT_EQ(result.raw(i), expectedResult[i]);
     EXPECT_EQ(indices.raw(i), expectedIndices[i]);
+  }
+}
+
+TEST_F(OnnxImporterTest, importMean) {
+  ExecutionEngine EE;
+  auto &mod = EE.getModule();
+  std::string netFilename(GLOW_DATA_PATH
+                          "tests/models/onnxModels/Mean.onnxtxt");
+  auto *F = mod.createFunction("main");
+  PlaceholderBindings bindings;
+  Placeholder *resultPH;
+  Tensor T0(ElemKind::FloatTy, {2, 3, 2});
+  Tensor T1(ElemKind::FloatTy, {2, 3, 2});
+  Tensor T2(ElemKind::FloatTy, {2, 3, 2});
+  T0.getHandle() = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+  T1.getHandle() = {11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0};
+  T2.getHandle() = {2.5, 1, 2.5, 1, 2.5, 1, 2.5, 1, 2.5, 1, 0, 1};
+  {
+    ONNXModelLoader onnxLD(netFilename, {"T0", "T1", "T2"},
+                           {&T0.getType(), &T1.getType(), &T2.getType()}, *F);
+    resultPH = EXIT_ON_ERR(onnxLD.getOutputByName("Y"));
+    bindings.allocate(mod.getPlaceholders());
+    updateInputPlaceholdersByName(bindings, &mod, {"T0", "T1", "T2"},
+                                  {&T0, &T1, &T2});
+  }
+  EE.compile(CompilationMode::Infer);
+  EE.run(bindings);
+  auto result = bindings.get(resultPH)->getHandle();
+  std::vector<dim_t> expectedDims = {2, 3, 2};
+  EXPECT_TRUE(result.dims().vec() == expectedDims);
+  std::vector<float> expectedResult = {4.5, 4, 4.5, 4, 4.5,      4,
+                                       4.5, 4, 4.5, 4, 11.0 / 3, 4};
+  for (size_t i = 0; i < expectedResult.size(); i++) {
+    EXPECT_EQ(result.raw(i), expectedResult[i]);
+  }
+}
+
+TEST_F(OnnxImporterTest, importMeanBroadcast) {
+  ExecutionEngine EE;
+  auto &mod = EE.getModule();
+  std::string netFilename(GLOW_DATA_PATH
+                          "tests/models/onnxModels/Mean_broadcast.onnxtxt");
+  auto *F = mod.createFunction("main");
+  PlaceholderBindings bindings;
+  Placeholder *resultPH;
+  Tensor T0(ElemKind::FloatTy, {1, 2, 1});
+  Tensor T1(ElemKind::FloatTy, {3});
+  Tensor T2(ElemKind::FloatTy, {1, 2, 3});
+  T0.getHandle() = {0, 1};
+  T1.getHandle() = {11, 10, 9};
+  T2.getHandle() = {5, 4, 3, 2, 1, 0};
+
+  {
+    ONNXModelLoader onnxLD(netFilename, {"T0", "T1", "T2"},
+                           {&T0.getType(), &T1.getType(), &T2.getType()}, *F);
+    resultPH = EXIT_ON_ERR(onnxLD.getOutputByName("Y"));
+    bindings.allocate(mod.getPlaceholders());
+    updateInputPlaceholdersByName(bindings, &mod, {"T0", "T1", "T2"},
+                                  {&T0, &T1, &T2});
+  }
+  EE.compile(CompilationMode::Infer);
+  EE.run(bindings);
+  auto result = bindings.get(resultPH)->getHandle();
+  std::vector<dim_t> expectedDims = {1, 2, 3};
+  EXPECT_TRUE(result.dims().vec() == expectedDims);
+  std::vector<float> expectedResult = {16.0 / 3, 14.0 / 3, 4.0,
+                                       14.0 / 3, 4.0,      10.0 / 3};
+  for (size_t i = 0; i < expectedResult.size(); i++) {
+    EXPECT_EQ(result.raw(i), expectedResult[i]);
   }
 }
 
@@ -3653,18 +3710,7 @@ static void importRNN(std::string fileName) {
   {
     ONNXModelLoader onnxLD(fileName, {}, {}, *F);
     bindings.allocate(mod.getPlaceholders());
-    auto Y_h_nv = EXIT_ON_ERR(onnxLD.getNodeValueByName("Y_h"));
-    EXPECT_TRUE(Y_h_nv.getNode());
   }
-
-  // Search RNN state placeholder and set to 0.
-  Placeholder *Y_h_ph = nullptr;
-  for (const auto &ph : mod.getPlaceholders()) {
-    if (llvm::StringRef(ph->getName()).endswith("Y_h"))
-      Y_h_ph = ph;
-  }
-  EXPECT_TRUE(Y_h_ph);
-  bindings.get(Y_h_ph)->zero();
 
   // Compile and run.
   EE.compile(CompilationMode::Infer);
@@ -3710,18 +3756,7 @@ static void importGRU(std::string fileName) {
   {
     ONNXModelLoader onnxLD(fileName, {}, {}, *F);
     bindings.allocate(mod.getPlaceholders());
-    auto Y_h_nv = EXIT_ON_ERR(onnxLD.getNodeValueByName("Y_h"));
-    EXPECT_TRUE(Y_h_nv.getNode());
   }
-
-  // Search GRU state placeholder and set to 0.
-  Placeholder *Y_h_ph = nullptr;
-  for (const auto &ph : mod.getPlaceholders()) {
-    if (llvm::StringRef(ph->getName()).endswith("Y_h"))
-      Y_h_ph = ph;
-  }
-  EXPECT_TRUE(Y_h_ph);
-  bindings.get(Y_h_ph)->zero();
 
   // Compile and run.
   EE.compile(CompilationMode::Infer);
@@ -3772,25 +3807,7 @@ static void importLSTM(std::string fileName) {
   {
     ONNXModelLoader onnxLD(fileName, {}, {}, *F);
     bindings.allocate(mod.getPlaceholders());
-    auto Y_h_nv = EXIT_ON_ERR(onnxLD.getNodeValueByName("Y_h"));
-    auto Y_c_nv = EXIT_ON_ERR(onnxLD.getNodeValueByName("Y_c"));
-    EXPECT_TRUE(Y_h_nv.getNode());
-    EXPECT_TRUE(Y_c_nv.getNode());
   }
-
-  // Search LSTM state placeholders and set to 0.
-  Placeholder *Y_h_ph = nullptr;
-  Placeholder *Y_c_ph = nullptr;
-  for (const auto &ph : mod.getPlaceholders()) {
-    if (llvm::StringRef(ph->getName()).endswith("Y_h"))
-      Y_h_ph = ph;
-    if (llvm::StringRef(ph->getName()).endswith("Y_c"))
-      Y_c_ph = ph;
-  }
-  EXPECT_TRUE(Y_h_ph);
-  EXPECT_TRUE(Y_c_ph);
-  bindings.get(Y_h_ph)->zero();
-  bindings.get(Y_c_ph)->zero();
 
   // Compile and run.
   EE.compile(CompilationMode::Infer);
@@ -4295,6 +4312,30 @@ static void importResizeBilinear(std::string filename) {
                                           {bindings.get(output)}));
 }
 
+TEST_F(OnnxImporterTest, importBoolFromInt) {
+  ExecutionEngine EE;
+  auto &mod = EE.getModule();
+  std::string netFilename(GLOW_DATA_PATH
+                          "tests/models/onnxModels/bool_from_int.onnxtxt");
+  auto *F = mod.createFunction("main");
+  PlaceholderBindings bindings;
+  Placeholder *output;
+  {
+    ONNXModelLoader onnxLD(netFilename, {}, {}, *F);
+    output = EXIT_ON_ERR(onnxLD.getSingleOutput());
+    ASSERT_TRUE(output);
+  }
+
+  EE.compile(CompilationMode::Infer);
+  bindings.allocate(mod.getPlaceholders());
+  EE.run(bindings);
+
+  std::vector<bool> expectedOut = {true, false, true};
+  auto result = bindings.get(output)->getHandle<bool>();
+  for (size_t i = 0; i < result.getType().size(); i++)
+    EXPECT_EQ(result.raw(i), expectedOut[i]);
+}
+
 /// ResizeNearest Test Helper.
 TEST(onnx, importResizeBilinear) {
   std::string netFilename(GLOW_DATA_PATH
@@ -4715,5 +4756,39 @@ TEST(onnx, importNames) {
     // Make sure original names are retained in the legalized names.
     EXPECT_EQ(prevNode->getName().find(origNames[i]), 0);
     currNode = prevNode;
+  }
+}
+
+TEST(onnx, importClipV11) {
+  // Test loading Clip in opset v11 format where min(-2) and max(2) are passed
+  // as inputs.
+  ExecutionEngine EE;
+  auto &mod = EE.getModule();
+  std::string netFilename(GLOW_DATA_PATH
+                          "tests/models/onnxModels/clipv11.onnxtxt");
+  auto *F = mod.createFunction("main");
+  PlaceholderBindings bindings;
+  Placeholder *output_0;
+
+  Tensor X(ElemKind::FloatTy, {1, 2, 2, 2});
+  X.getHandle() = {-3, -2, -1, 0, 1, 2, 3, 4};
+
+  {
+    ONNXModelLoader onnxLD(netFilename, {"X"}, {&X.getType()}, *F);
+    output_0 = EXIT_ON_ERR(onnxLD.getOutputByName("output0"));
+    bindings.allocate(mod.getPlaceholders());
+    updateInputPlaceholdersByName(bindings, &mod, {"X"}, {&X});
+  }
+
+  EE.compile(CompilationMode::Infer);
+  EE.run(bindings);
+
+  std::vector<dim_t> expectedDims = {1, 2, 2, 2};
+  std::vector<float> expectedValues = {-2, -2, -1, 0, 1, 2, 2, 2};
+  auto result = bindings.get(output_0)->getHandle();
+  EXPECT_EQ(result.dims().vec(), expectedDims);
+
+  for (size_t i = 0; i < 8; i++) {
+    EXPECT_FLOAT_EQ(result.raw(i), expectedValues[i]);
   }
 }

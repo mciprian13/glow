@@ -188,6 +188,7 @@ int main(int argc, char **argv) {
       .addMember(MemberType::VectorUnsigned, "Strides")
       .addMember(MemberType::VectorUnsigned, "Pads", /* addSetter */ true)
       .addMember(MemberType::Enum, "Layout")
+      .addMember(MemberType::Boolean, "CountIncludePads")
       .addResultFromCtorArg()
       .addGradient()
       .setDocstring(
@@ -303,6 +304,13 @@ int main(int argc, char **argv) {
       .setDocstring("Apply box-cox transform for each column for each column "
                     "in NxD input tensor");
 
+  BB.newNode("VectorNorm")
+      .addInput("Input")
+      .addMember(MemberType::Unsigned, "Axis")
+      .addMember(MemberType::Unsigned, "P")
+      .addResultFromCtorArg()
+      .setDocstring("Performs L2 norm of the Input operand based on Axis.");
+
   //===--------------------------------------------------------------------===//
   //                     Bucketing
   //===--------------------------------------------------------------------===//
@@ -380,6 +388,13 @@ int main(int argc, char **argv) {
       .dataParallel()
       .addGradient()
       .setDocstring("Performs Div on the LHS and RHS operands.");
+
+  BB.newNode("FloorDiv")
+      .addInput("LHS")
+      .addInput("RHS")
+      .addResultFromCtorArg()
+      .dataParallel()
+      .setDocstring("Performs Div on the LHS and RHS operands, then Floor.");
 
   BB.newNode("Max")
       .addInput("LHS")
@@ -589,6 +604,13 @@ int main(int argc, char **argv) {
       .addResultFromCtorArg()
       .setDocstring(
           "Adds the 'Slice' operand to each one of the slices in the batch.");
+
+  BB.newNode("BatchedMul")
+      .addInput("Batch")
+      .addInput("Slice")
+      .addResultFromCtorArg()
+      .setDocstring("Multiplies the 'Slice' operand to each one of the slices "
+                    "in the batch.");
 
   BB.newNode("MatMul")
       .addInput("LHS")
@@ -935,6 +957,15 @@ int main(int argc, char **argv) {
       .addGradient()
       .setDocstring("Applies hyperbolic tangent to each element in the Input "
                     "tensor.");
+
+  BB.newNode("LeakyRelu")
+      .addInput("Input")
+      .addMember(MemberType::Float, "Alpha")
+      .addResultFromCtorArg()
+      .dataParallel()
+      .setDocstring(
+          "Applies LeakyReLU = x for positive x and alpha * x for negative x "
+          "to each element in the Input tensor.");
 
   //===--------------------------------------------------------------------===//
   //                Shape transformations
@@ -1304,7 +1335,7 @@ int main(int argc, char **argv) {
       .addInput("FeatureMap")
       .addInput("Boxes")
       .addInput("BatchIndices")
-      .addMember(MemberType::String, "Mode")
+      .addMember(MemberType::Enum, "Mode")
       .addMember(MemberType::Unsigned, "OutputHeight")
       .addMember(MemberType::Unsigned, "OutputWidth")
       .addMember(MemberType::Unsigned, "SamplingRatio")
@@ -1313,7 +1344,7 @@ int main(int argc, char **argv) {
       .addMember(MemberType::Boolean, "Rotated")
       .addResultFromCtorArg()
       .setDocstring(
-          "Performs region of interest (ROI) align operator. "
+          "Performs region of interest align (ROI) operator. "
           "FeatureMap - a tensor of [N,H,W,C]. N is the batch, C is the "
           "channel, H is the height, W is the width. "
           "Boxes - a tensor of [K,4] or [K,5] with format "

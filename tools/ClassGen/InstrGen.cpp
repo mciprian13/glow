@@ -169,6 +169,7 @@ int main(int argc, char **argv) {
       .addMember(MemberType::VectorUnsigned, "Strides")
       .addMember(MemberType::VectorUnsigned, "Pads")
       .addMember(MemberType::Unsigned, "Layout")
+      .addMember(MemberType::Boolean, "CountIncludePads")
       .autoIRGen()
       .autoVerify(VerifyKind::SameElementType, {"Dest", "Src"})
       .addGradientInstr({"Dest", "Src"}, {"Dest", "Src"});
@@ -871,6 +872,19 @@ int main(int argc, char **argv) {
       .autoVerify(VerifyKind::SameType, {"Dest", "Src"})
       .autoIRGen();
 
+  BB.newInstr("LeakyRelu")
+      .addOperand("Dest", OperandKind::Out)
+      .addOperand("Src", OperandKind::In)
+      .addMember(MemberType::Float, "Alpha")
+      .inplaceOperand({
+          "Dest",
+          "Src",
+      })
+      .dataParallel()
+      .autoVerify(VerifyKind::SameShape, {"Dest", "Src"})
+      .autoVerify(VerifyKind::SameElementType, {"Dest", "Src"})
+      .autoIRGen();
+
   //===--------------------------------------------------------------------===//
   //                Shape transformations
   //===--------------------------------------------------------------------===//
@@ -1127,7 +1141,7 @@ int main(int argc, char **argv) {
       .addOperand("FeatureMap", OperandKind::In)
       .addOperand("Boxes", OperandKind::In)
       .addOperand("BatchIndices", OperandKind::In)
-      .addMember(MemberType::String, "Mode")
+      .addMember(MemberType::Enum, "Mode")
       .addMember(MemberType::Unsigned, "OutputHeight")
       .addMember(MemberType::Unsigned, "OutputWidth")
       .addMember(MemberType::Unsigned, "SamplingRatio")
