@@ -458,6 +458,9 @@ void libjit_channelwise_quantized_conv3d_generic(
 } // namespace
 
 extern "C" {
+
+#if 0
+
 void libjit_conv2d_f(float *outW, const float *inW, const float *filterW,
                      const float *biasW, const dim_t *outWdims,
                      const dim_t *inWdims, const dim_t *filterWdims,
@@ -575,6 +578,110 @@ void libjit_conv2d_f(float *outW, const float *inW, const float *filterW,
     }         // For each group in the input channel.
   }           // For each N, the sample in the batch.
 }
+
+#else
+
+void libjit_conv2d_f(float *outW, const float *inW, const float *filterW,
+                     const float *biasW, const dim_t *outWdims,
+                     const dim_t *inWdims, const dim_t *filterWdims,
+                     const dim_t *biasWdims, const dim_t *kernelSizes,
+                     const dim_t *strides, const dim_t *pads, dim_t group,
+                     unsigned depthUnroll, dim_t dilation) {
+  dim_t inChannels = inWdims[3];
+  dim_t outChannels = outWdims[3];
+
+  dim_t inCperG = inChannels / group;
+  dim_t outCperG = outChannels / group;
+
+  dim_t padT = pads[0];
+  dim_t padL = pads[1];
+
+  size_t strideH = strides[0];
+  size_t strideW = strides[1];
+
+  size_t kernelH = kernelSizes[0];
+  size_t kernelW = kernelSizes[1];
+
+  size_t dilationH = dilation;
+  size_t dilationW = dilation;
+
+  // For each input in the batch.
+  for (size_t n = 0; n < inWdims[0]; n++) {
+
+    // For each group of input channels.
+    for (size_t g = 0; g < group; g++) {
+
+      // For each output channel in the group.
+      for (size_t o_c = g * outCperG; o_c < (g + 1) * outCperG; o_c++) {
+
+        // For each output height.
+        ssize_t i_h_start = -(ssize_t)padT;
+        for (size_t o_h = 0; o_h < outWdims[1]; o_h++, i_h_start += strideH) {
+
+          // For each output width.
+          ssize_t i_w_start = -(ssize_t)padL;
+          for (size_t o_w = 0; o_w < outWdims[2]; o_w++, i_w_start += strideW) {
+
+            // Scale the bias to match the scale of the matrix multiplication.
+            float sum = biasW[o_c];
+
+            // For each filter height.
+            for (size_t f_h = 0; f_h < kernelH; f_h++) {
+
+              // Skip due to input H padding.
+              ssize_t i_h = i_h_start + f_h * dilationH;
+              if (i_h < 0 ||  i_h >= (ssize_t)inWdims[1]) {
+                filterW += filterWdims[2] * filterWdims[3];
+                continue;
+              }
+
+              // For each filter width.
+              for (size_t f_w = 0; f_w < kernelW; f_w++) {
+
+                // Skip due to input W padding.
+                ssize_t i_w = i_w_start + f_w * dilationW;
+                if (i_w < 0 || i_w >= (ssize_t)inWdims[2]) {
+                  filterW += filterWdims[3];
+                  continue;
+                }
+
+                // Compute current indices into filter and input buffers.
+                size_t inpIdx = i_h * inWdims[2] * inWdims[3] + i_w * inWdims[3] + g * inCperG;
+
+                // Accumulate along the filter depth.
+                for (size_t f_c = 0; f_c < inCperG; f_c++) {
+                  sum += (*filterW++) * (inW[inpIdx + f_c]);
+                }
+              }
+            }
+
+            // Compute current index into output buffer.
+            size_t outIdx = o_h * outWdims[2] * outWdims[3] + o_w * outWdims[3] + o_c;
+
+            // Write output.
+            outW[outIdx] = sum;
+
+            // Reset filter pointer for next output height/width.
+            filterW -= filterWdims[1] * filterWdims[2] * filterWdims[3];
+          } // W
+        } // H
+
+        // Advance filter pointer for next output channel.
+        filterW += filterWdims[1] * filterWdims[2] * filterWdims[3];
+
+      } // C
+    } // G
+
+    // Reset filter pointer for next batch.
+    filterW -= filterWdims[0] * filterWdims[1] * filterWdims[2] * filterWdims[3];
+
+    // Advance input/output pointers for next batch.
+    inW  += inWdims [1] * inWdims [2] * inWdims [3];
+    outW += outWdims[1] * outWdims[2] * outWdims[3];
+  } // N
+}
+
+#endif
 
 void libjit_conv2d_i8_i32(
     int8_t *outW, const int8_t *inW, const int8_t *filterW,

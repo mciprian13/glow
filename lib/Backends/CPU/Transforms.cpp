@@ -36,6 +36,11 @@ static Node *optimizeCPUConv(ConvolutionNode *CN, Function *F) {
   auto *M = F->getParent();
   auto group = CN->getGroup();
 
+  // ================================================================
+  // Disable ConvDKKC8 for now!
+  return nullptr;
+  // ================================================================
+
   // Make sure that the depth group is divisible by 64 to perform the
   // transformation. This transformation is currently only profitable on
   // low-channel convolutions.
