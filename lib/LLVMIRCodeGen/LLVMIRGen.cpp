@@ -2147,6 +2147,14 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
 
       auto *F = getFunction("conv2d", dest->getElementType());
 
+      if (CI->getKernels()[0] == 1 && CI->getKernels()[1] == 1) {
+        F = getFunction("conv2d_1x1", dest->getElementType());
+      }
+
+      if (CI->getGroup() > 1) {
+        F = getFunction("conv2d_dw", dest->getElementType());
+      }
+
       createCall(builder, F,
                  {destPtr, srcPtr, filterPtr, biasPtr, destDims, srcDims,
                   filterDims, biasDims, kernels, strides, pads, group, unrollD,
