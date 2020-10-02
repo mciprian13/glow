@@ -739,102 +739,7 @@ void libjit_conv2d_1x1_f(float *outW, const float *inW, const float *filterW,
   } // N
 }
 
-#if 0
-// V1 Kernel limitations:
-// - dilations are 1
-// - group = inpC = outC
-void libjit_conv2d_dw_f(float *outW, const float *inW, const float *filterW,
-                        const float *biasW, const dim_t *outWdims,
-                        const dim_t *inWdims, const dim_t *filterWdims,
-                        const dim_t *biasWdims, const dim_t *kernelSizes,
-                        const dim_t *strides, const dim_t *pads, dim_t group,
-                        unsigned depthUnroll, dim_t dilation) {
-
-  dim_t padT = pads[0];
-  dim_t padL = pads[1];
-
-  size_t strideH = strides[0];
-  size_t strideW = strides[1];
-
-  size_t kernelH = kernelSizes[0];
-  size_t kernelW = kernelSizes[1];
-
-  // For each input in the batch.
-  for (size_t n = 0; n < inWdims[0]; n++) {
-
-    // For each output channel.
-    for (size_t o_c = 0; o_c < outWdims[3]; o_c++) {
-
-      // For each output height.
-      ssize_t i_h_min = -(ssize_t)padT;
-      for (size_t o_h = 0; o_h < outWdims[1]; o_h++, i_h_min += strideH) {
-
-        // For each output width.
-        ssize_t i_w_min = -(ssize_t)padL;
-        for (size_t o_w = 0; o_w < outWdims[2]; o_w++, i_w_min += strideW) {
-
-          // Initialize sum.
-          float sum = biasW[o_c];
-
-          // For each filter height.
-          for (size_t f_h = 0; f_h < kernelH; f_h++) {
-
-            // Skip due to input H padding.
-            ssize_t i_h = i_h_min + f_h;
-            if (i_h < 0 ||  i_h >= (ssize_t)inWdims[1]) {
-              filterW += filterWdims[2] * filterWdims[3];
-              continue;
-            }
-
-            // For each filter width.
-            for (size_t f_w = 0; f_w < kernelW; f_w++) {
-
-              // Skip due to input W padding.
-              ssize_t i_w = i_w_min + f_w;
-              if (i_w < 0 || i_w >= (ssize_t)inWdims[2]) {
-                filterW += filterWdims[3];
-                continue;
-              }
-
-              // Compute current indices into filter and input buffers.
-              size_t inpIdx = i_h * inWdims[2] * inWdims[3] + i_w * inWdims[3];
-
-              // Accumulate along the filter height/width plane.
-              sum += (*filterW++) * (inW[inpIdx]);
-            }
-          }
-
-          // Compute current index into output buffer.
-          size_t outIdx = o_h * outWdims[2] * outWdims[3] + o_w * outWdims[3];
-
-          // Write output.
-          outW[outIdx] = sum;
-
-          // Reset filter pointer for next output height/width.
-          filterW -= filterWdims[1] * filterWdims[2] * filterWdims[3];
-        } // W
-      } // H
-
-      // Advance filter pointer for next output channel.
-      filterW += filterWdims[1] * filterWdims[2] * filterWdims[3];
-
-      // Advance input/output pointer for next output channel.
-      inW++;
-      outW++;
-    } // C
-
-    // Reset filter pointer for next batch.
-    filterW -= filterWdims[0] * filterWdims[1] * filterWdims[2] * filterWdims[3];
-
-    // Advance input/output pointers for next batch.
-    inW  += inWdims [1] * inWdims [2] * inWdims [3] - inWdims [3];
-    outW += outWdims[1] * outWdims[2] * outWdims[3] - outWdims[3];
-  } // N
-}
-
-#else
-
-// Kernel V2 limitations:
+// Kernel limitations:
 // - dilations are 1
 // - group = inpC = outC
 void libjit_conv2d_dw_f(float *outW, const float *inW, const float *filterW,
@@ -857,16 +762,30 @@ void libjit_conv2d_dw_f(float *outW, const float *inW, const float *filterW,
   for (size_t n = 0; n < inWdims[0]; n++) {
 
     // For each output height.
-    for (size_t o_h = 0; o_h < outWdims[1]; o_h++) {
+    ssize_t i_h_min = -(ssize_t)padT;
+    for (size_t o_h = 0; o_h < outWdims[1]; o_h++, i_h_min += strideH) {
 
-      ssize_t f_h_min = MAX(      0,              padT - o_h * strideH);
-      ssize_t f_h_max = MIN(kernelH, inWdims[1] + padT - o_h * strideH);
+      size_t f_h_min = MAX(      0,            - i_h_min);
+      size_t f_h_max = MIN(kernelH, inWdims[1] - i_h_min);
+      size_t f_h_len = f_h_max - f_h_min;
+
+      const float *fltPtrH = filterW + f_h_min * kernelW;
+      const float *inpPtrH = inW     + (i_h_min + f_h_min) * inWdims[2] * inWdims[3];
 
       // For each output width.
-      for (size_t o_w = 0; o_w < outWdims[2]; o_w++) {
+      ssize_t i_w_min = -(ssize_t)padL;
+      for (size_t o_w = 0; o_w < outWdims[2]; o_w++, i_w_min += strideW) {
 
-        ssize_t f_w_min = MAX(      0,              padL - o_w * strideW);
-        ssize_t f_w_max = MIN(kernelW, inWdims[2] + padL - o_w * strideW);
+        size_t f_w_min = MAX(      0,            - i_w_min);
+        size_t f_w_max = MIN(kernelW, inWdims[2] - i_w_min);
+        size_t f_w_len = f_w_max - f_w_min;
+
+        const float *fltPtr = fltPtrH + f_w_min;
+        const float *inpPtr = inpPtrH + (i_w_min + f_w_min) * inWdims[3];
+
+        // Backup pointers.
+        const float *fltPtrSave = fltPtr;
+        const float *inpPtrSave = inpPtr;
 
         // For each output channel.
         for (size_t o_c = 0; o_c < outWdims[3]; o_c++) {
@@ -875,34 +794,39 @@ void libjit_conv2d_dw_f(float *outW, const float *inW, const float *filterW,
           float sum = biasW[o_c];
 
           // For each filter height.
-          for (size_t f_h = f_h_min; f_h < f_h_max; f_h++) {
+          for (size_t f_h = 0; f_h < f_h_len; f_h++) {
 
             // For each filter width.
-            for (size_t f_w = f_w_min; f_w < f_w_max; f_w++) {
+            for (size_t f_w = 0; f_w < f_w_len; f_w++) {
 
               // Accumulate along the filter height/width plane.
-              sum += (*filterW) * (*inW);
+              sum += (*fltPtr) * (*inpPtr);
 
-              // Advance pointers for next width.
-              filterW ++;
-              inW += inWdims[3];
+              // Advance pointers for next filter width.
+              fltPtr++;
+              inpPtr += inWdims[3];
             }
-            
-            // Advance pointers for next height.
-            
-            
+
+            // Advance pointers for next filter height.
+            fltPtr = fltPtr - f_w_len + kernelW;
+            inpPtr = inpPtr - f_w_len * inWdims[3] + inWdims[2] * inWdims[3];
           }
 
           // Write output.
           *outW++ = sum;
 
+          // Advance pointers for next channel.
+          fltPtr = fltPtrSave + (o_c + 1) * kernelH * kernelW;
+          inpPtr = inpPtrSave + (o_c + 1) * 1;
         } // C
       } // W
     } // H
+
+    // Advance input pointer for next batch.
+    inW  += inWdims [1] * inWdims [2] * inWdims [3];
+
   } // N
 }
-
-#endif
 
 #endif
 
