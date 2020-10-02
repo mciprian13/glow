@@ -681,18 +681,19 @@ void libjit_conv2d_f(float *outW, const float *inW, const float *filterW,
   } // N
 }
 
-// Kernel limitations:
+// Kernel V1 limitations:
 // - kernel sizes are 1
 // - stride sizes are 1
 // - dilations are 1
 // - paddings are 0
 // - group is 1
-void libjit_conv2d_1x1_f(float *outW, const float *inW, const float *filterW,
-                         const float *biasW, const dim_t *outWdims,
-                         const dim_t *inWdims, const dim_t *filterWdims,
-                         const dim_t *biasWdims, const dim_t *kernelSizes,
-                         const dim_t *strides, const dim_t *pads, dim_t group,
-                         unsigned depthUnroll, dim_t dilation) {
+// NOTE: Use this when outputH x outputW < outputC
+void libjit_conv2d_1x1_v1_f(float *outW, const float *inW, const float *filterW,
+                            const float *biasW, const dim_t *outWdims,
+                            const dim_t *inWdims, const dim_t *filterWdims,
+                            const dim_t *biasWdims, const dim_t *kernelSizes,
+                            const dim_t *strides, const dim_t *pads, dim_t group,
+                            unsigned depthUnroll, dim_t dilation) {
 
   // For each input in the batch.
   for (size_t n = 0; n < inWdims[0]; n++) {
@@ -700,7 +701,7 @@ void libjit_conv2d_1x1_f(float *outW, const float *inW, const float *filterW,
     // For each output channel.
     for (size_t o_c = 0; o_c < outWdims[3]; o_c++) {
 
-      // For each output height/width plane.
+      // For each output depth column.
       for (size_t o_hw = 0; o_hw < outWdims[1] * outWdims[2]; o_hw++) {
 
         // Initialize sum.
@@ -736,6 +737,53 @@ void libjit_conv2d_1x1_f(float *outW, const float *inW, const float *filterW,
     // Advance input/output pointers for next batch.
     inW  += inWdims [1] * inWdims [2] * inWdims [3];
     outW += outWdims[1] * outWdims[2] * outWdims[3] - outWdims[3];
+  } // N
+}
+
+// Kernel V2 limitations:
+// - kernel sizes are 1
+// - stride sizes are 1
+// - dilations are 1
+// - paddings are 0
+// - group is 1
+// NOTE: Use this when outputH x outputW > outputC
+void libjit_conv2d_1x1_v2_f(float *outW, const float *inW, const float *filterW,
+                            const float *biasW, const dim_t *outWdims,
+                            const dim_t *inWdims, const dim_t *filterWdims,
+                            const dim_t *biasWdims, const dim_t *kernelSizes,
+                            const dim_t *strides, const dim_t *pads, dim_t group,
+                            unsigned depthUnroll, dim_t dilation) {
+
+  // For each input in the batch.
+  for (size_t n = 0; n < inWdims[0]; n++) {
+
+    // For each output depth column.
+    for (size_t o_hw = 0; o_hw < outWdims[1] * outWdims[2]; o_hw++) {
+
+      // For each output channel.
+      for (size_t o_c = 0; o_c < outWdims[3]; o_c++) {
+
+        // Initialize sum.
+        float sum = biasW[o_c];
+
+        // Accumulate along the filter depth.
+        for (size_t f_c = 0; f_c < inWdims[3]; f_c++) {
+          sum += (*filterW++) * (*inW++);
+        }
+
+        // Reset input pointer for next output channel.
+        inW -= inWdims[3];
+
+        // Store output.
+        *outW++ = sum;
+      }
+
+      // Advance input pointer for next output depth column.
+      inW += inWdims[3];
+
+      // Reset filter pointer for next output depth column.
+      filterW -= filterWdims[0] * filterWdims[1] * filterWdims[2] * filterWdims[3];
+    }
   } // N
 }
 
@@ -815,7 +863,7 @@ void libjit_conv2d_dw_f(float *outW, const float *inW, const float *filterW,
           // Write output.
           *outW++ = sum;
 
-          // Advance pointers for next channel.
+          // Advance pointers for next output channel.
           fltPtr = fltPtrSave + (o_c + 1) * kernelH * kernelW;
           inpPtr = inpPtrSave + (o_c + 1) * 1;
         } // C
@@ -824,7 +872,6 @@ void libjit_conv2d_dw_f(float *outW, const float *inW, const float *filterW,
 
     // Advance input pointer for next batch.
     inW  += inWdims [1] * inWdims [2] * inWdims [3];
-
   } // N
 }
 

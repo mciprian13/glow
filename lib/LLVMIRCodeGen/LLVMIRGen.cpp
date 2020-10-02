@@ -2148,7 +2148,17 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
       auto *F = getFunction("conv2d", dest->getElementType());
 
       if (CI->getKernels()[0] == 1 && CI->getKernels()[1] == 1) {
-        F = getFunction("conv2d_1x1", dest->getElementType());
+
+        auto outputH = dest->dims()[1];
+        auto outputW = dest->dims()[2];
+        auto outputC = dest->dims()[3];
+
+        if (outputH * outputW < outputC) {
+          F = getFunction("conv2d_1x1_v1", dest->getElementType());
+        } else {
+          F = getFunction("conv2d_1x1_v2", dest->getElementType());
+        }
+
       }
 
       if (CI->getGroup() > 1) {
