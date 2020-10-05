@@ -587,6 +587,7 @@ void libjit_conv2d_f(float *outW, const float *inW, const float *filterW,
                      const dim_t *biasWdims, const dim_t *kernelSizes,
                      const dim_t *strides, const dim_t *pads, dim_t group,
                      unsigned depthUnroll, dim_t dilation) {
+
   dim_t inChannels = inWdims[3];
   dim_t outChannels = outWdims[3];
 
@@ -681,115 +682,328 @@ void libjit_conv2d_f(float *outW, const float *inW, const float *filterW,
   } // N
 }
 
-// Kernel V1 limitations:
+// -----------------------------------------------------------------------------
+//                           Batched Matrix Multiplication V1
+// -----------------------------------------------------------------------------
+// NOTE: N INPUT x 1 FILTER
+// NOTE: Use this when inpNum < fltNum for better data locality.
+// NOTE: Use inpNumGrp to optimize for best data cache locality.
+// NOTE: The parameter inpNumGrp must be within 1 ... inpNum.
+// -----------------------------------------------------------------------------
+static inline __attribute__((always_inline))
+void libjit_mat_mul_v1_f(      float *outPtr,
+                         const float *inpPtr,
+                         const float *fltPtr,
+                         const float *biasPtr,
+                         const dim_t batchNum,     // Batch size.
+                         const dim_t inpNum,       // Number of input vectors.
+                         const dim_t fltNum,       // Number of filter vectors.
+                         const dim_t vecLen,       // Vector length.
+                         const dim_t inpNumGrp     // Number of input vector per group.
+                         ) {
+
+  // Group parameters.
+  size_t inpGrp = inpNum / inpNumGrp;
+  size_t inpRem = inpNum % inpNumGrp;
+
+  // For each input in the batch.
+  for (size_t n = 0; n < batchNum; n++) {
+
+    // ---------------------------- Group part ---------------------------------
+    // For each input group.
+    for (size_t g_idx = 0; g_idx < inpGrp; g_idx++) {
+
+      // For each filter vector.
+      for (size_t f_idx = 0; f_idx < fltNum; f_idx++) {
+
+        float biasVal = biasPtr[f_idx];
+
+        // For each input vector in the group.
+        for (size_t i_idx = 0; i_idx < inpNumGrp; i_idx++) {
+
+          // Initialize sum.
+          float sum = biasVal;
+
+          // Accumulate along the vector depth.
+          for (size_t idx = 0; idx < vecLen; idx++) {
+            sum += (*fltPtr++) * (*inpPtr++);
+          }
+
+          // Reset filter pointer.
+          fltPtr -= vecLen;
+
+          // Store output.
+          *outPtr = sum;
+          outPtr += fltNum;
+        }
+
+        // Reset input pointer.
+        inpPtr -= inpNumGrp * vecLen;
+
+        // Advance filter pointer.
+        fltPtr += vecLen;
+
+        // Advance output pointer.
+        outPtr -= inpNumGrp * fltNum;
+        outPtr++;
+      }
+
+      // Reset filter pointer for next group.
+      fltPtr -= fltNum * vecLen;
+
+      // Advance input/output pointer for next group.
+      inpPtr += inpNumGrp * vecLen;
+      outPtr += inpNumGrp * fltNum - fltNum;
+    }
+
+    // -------------------------- Remaining part -------------------------------
+    if (inpRem > 0) {
+
+      // For each filter vector.
+      for (size_t f_idx = 0; f_idx < fltNum; f_idx++) {
+
+        float biasVal = biasPtr[f_idx];
+
+        // For each input vector.
+        for (size_t i_idx = 0; i_idx < inpRem; i_idx++) {
+
+          // Initialize sum.
+          float sum = biasVal;
+
+          // Accumulate along the vector depth.
+          for (size_t idx = 0; idx < vecLen; idx++) {
+            sum += (*fltPtr++) * (*inpPtr++);
+          }
+
+          // Reset filter pointer.
+          fltPtr -= vecLen;
+
+          // Store output.
+          *outPtr = sum;
+          outPtr += fltNum;
+        }
+
+        // Reset input pointer.
+        inpPtr -= inpRem * vecLen;
+
+        // Advance filter pointer.
+        fltPtr += vecLen;
+
+        // Advance output pointer.
+        outPtr -= inpRem * fltNum;
+        outPtr++;
+      }
+
+      // Reset filter pointer for next batch.
+      fltPtr -= fltNum * vecLen;
+
+      // Advance input/output pointers for next batch.
+      inpPtr += inpRem * vecLen;
+      outPtr += inpRem * fltNum - fltNum;
+    }
+  }
+}
+
+// -----------------------------------------------------------------------------
+//                           Batched Matrix Multiplication V2
+// -----------------------------------------------------------------------------
+// NOTE: 1 INPUT x N FILTER
+// NOTE: Use this when inpNum > fltNum for better data locality.
+// NOTE: Use fltNumGrp to optimize for best data cache locality.
+// NOTE: The parameter fltNumGrp must be within 1 ... fltNum.
+// -----------------------------------------------------------------------------
+static inline __attribute__((always_inline))
+void libjit_mat_mul_v2_f(      float *outPtr,
+                         const float *inpPtr,
+                         const float *fltPtr,
+                         const float *biasPtr,
+                         const dim_t batchNum,     // Batch size.
+                         const dim_t inpNum,       // Number of input vectors.
+                         const dim_t fltNum,       // Number of filter vectors.
+                         const dim_t vecLen,       // Vector length.
+                         const dim_t fltNumGrp     // Number of filter vectors per group.
+                         ) {
+
+  // Group parameters.
+  size_t fltGrp = fltNum / fltNumGrp;
+  size_t fltRem = fltNum % fltNumGrp;
+
+  // For each input in the batch.
+  for (size_t n = 0; n < batchNum; n++) {
+
+    // ---------------------------- Group part ---------------------------------
+    // For each input group.
+    for (size_t g_idx = 0; g_idx < fltGrp; g_idx++) {
+
+      // For each input vector.
+      for (size_t i_idx = 0; i_idx < inpNum; i_idx++) {
+
+        // For each filter vector.
+        for (size_t f_idx = 0; f_idx < fltNumGrp; f_idx++) {
+
+          // Initialize sum.
+          float sum = *biasPtr++;
+
+          // Accumulate along the vector depth.
+          for (size_t idx = 0; idx < vecLen; idx++) {
+            sum += (*fltPtr++) * (*inpPtr++);
+          }
+
+          // Reset input pointer.
+          inpPtr -= vecLen;
+
+          // Store output.
+          *outPtr++ = sum;
+        }
+
+        // Advance input pointer.
+        inpPtr += vecLen;
+
+        // Reset bias pointer.
+        biasPtr -= fltNumGrp;
+
+        // Reset filter pointer.
+        fltPtr -= fltNumGrp * vecLen;
+
+        // Advance output pointer.
+        outPtr += fltNum - fltNumGrp;
+      }
+
+      // Reset input pointer for next group.
+      inpPtr -= inpNum * vecLen;
+
+      // Advance bias pointer for next group.
+      biasPtr += fltNumGrp;
+
+      // Advance filter pointer for next group.
+      fltPtr += fltNumGrp * vecLen;
+
+      // Advance output pointer for next group.
+      outPtr -= inpNum * fltNum;
+      outPtr += fltNumGrp;
+    }
+
+    // -------------------------- Remaining part -------------------------------
+    if (fltRem > 0) {
+
+      // For each input vector.
+      for (size_t i_idx = 0; i_idx < inpNum; i_idx++) {
+
+        // For each filter vector.
+        for (size_t f_idx = 0; f_idx < fltRem; f_idx++) {
+
+          // Initialize sum.
+          float sum = *biasPtr++;
+
+          // Accumulate along the vector depth.
+          for (size_t idx = 0; idx < vecLen; idx++) {
+            sum += (*fltPtr++) * (*inpPtr++);
+          }
+
+          // Reset input pointer.
+          inpPtr -= vecLen;
+
+          // Store output.
+          *outPtr++ = sum;
+        }
+
+        // Advance input pointer.
+        inpPtr += vecLen;
+
+        // Reset bias pointer.
+        biasPtr -= fltRem;
+
+        // Reset filter pointer.
+        fltPtr -= fltRem * vecLen;
+
+        // Advance output pointer.
+        outPtr += fltNum - fltRem;
+      }
+
+      // Reset bias pointer for next batch.
+      biasPtr += fltRem - fltNum;
+
+      // Reset filter pointer for next batch.
+      fltPtr += (fltRem - fltNum) * vecLen;
+
+      // Advance output pointer for next batch.
+      outPtr += fltRem - fltNum;
+    } else {
+
+      // Update pointers for next batch.
+      inpPtr += inpNum * vecLen;
+      biasPtr -= fltNum;
+      fltPtr -= fltNum * vecLen;
+      outPtr += fltNum * inpNum - fltNum;
+    }
+  }
+}
+
+// -----------------------------------------------------------------------------
+//                              1x1 Convolution V1
+// -----------------------------------------------------------------------------
 // - kernel sizes are 1
 // - stride sizes are 1
 // - dilations are 1
 // - paddings are 0
 // - group is 1
+// NOTE: 1 FILTER x N INPUT
 // NOTE: Use this when outputH x outputW < outputC
+// -----------------------------------------------------------------------------
 void libjit_conv2d_1x1_v1_f(float *outW, const float *inW, const float *filterW,
                             const float *biasW, const dim_t *outWdims,
                             const dim_t *inWdims, const dim_t *filterWdims,
                             const dim_t *biasWdims, const dim_t *kernelSizes,
                             const dim_t *strides, const dim_t *pads, dim_t group,
                             unsigned depthUnroll, dim_t dilation) {
-
-  // For each input in the batch.
-  for (size_t n = 0; n < inWdims[0]; n++) {
-
-    // For each output channel.
-    for (size_t o_c = 0; o_c < outWdims[3]; o_c++) {
-
-      // For each output depth column.
-      for (size_t o_hw = 0; o_hw < outWdims[1] * outWdims[2]; o_hw++) {
-
-        // Initialize sum.
-        float sum = biasW[o_c];
-
-        // Accumulate along the filter depth.
-        for (size_t f_c = 0; f_c < inWdims[3]; f_c++) {
-          sum += (*filterW++) * (*inW++);
-        }
-
-        // Reset filter pointer.
-        filterW -= filterWdims[3];
-
-        // Store output.
-        *outW = sum;
-        outW += outWdims[3];
-      }
-
-      // Reset input pointer for next output channel.
-      inW -= inWdims [1] * inWdims [2] * inWdims [3];
-
-      // Advance filter pointer for next output channel.
-      filterW += filterWdims[3];
-
-      // Advance output pointer for next output channel.
-      outW -= outWdims[1] * outWdims[2] * outWdims[3];
-      outW++;
-    }
-
-    // Reset filter pointer for next batch.
-    filterW -= filterWdims[0] * filterWdims[1] * filterWdims[2] * filterWdims[3];
-
-    // Advance input/output pointers for next batch.
-    inW  += inWdims [1] * inWdims [2] * inWdims [3];
-    outW += outWdims[1] * outWdims[2] * outWdims[3] - outWdims[3];
-  } // N
+  libjit_mat_mul_v1_f(outW,                       // outW
+                      inW,                        // inpPtr
+                      filterW,                    // fltPtr
+                      biasW,                      // biasPtr
+                      inWdims[0],                 // batchNum
+                      outWdims[1] * outWdims[2],  // inpNum
+                      outWdims[3],                // fltNum
+                      inWdims[3],                 // vecLen
+                      outWdims[1] * outWdims[2]   // inpNumGrp
+                     );
 }
 
-// Kernel V2 limitations:
+// -----------------------------------------------------------------------------
+//                              1x1 Convolution V2
+// -----------------------------------------------------------------------------
 // - kernel sizes are 1
 // - stride sizes are 1
 // - dilations are 1
 // - paddings are 0
 // - group is 1
+// NOTE: 1 INPUT x N FILTER
 // NOTE: Use this when outputH x outputW > outputC
+// -----------------------------------------------------------------------------
 void libjit_conv2d_1x1_v2_f(float *outW, const float *inW, const float *filterW,
                             const float *biasW, const dim_t *outWdims,
                             const dim_t *inWdims, const dim_t *filterWdims,
                             const dim_t *biasWdims, const dim_t *kernelSizes,
                             const dim_t *strides, const dim_t *pads, dim_t group,
                             unsigned depthUnroll, dim_t dilation) {
-
-  // For each input in the batch.
-  for (size_t n = 0; n < inWdims[0]; n++) {
-
-    // For each output depth column.
-    for (size_t o_hw = 0; o_hw < outWdims[1] * outWdims[2]; o_hw++) {
-
-      // For each output channel.
-      for (size_t o_c = 0; o_c < outWdims[3]; o_c++) {
-
-        // Initialize sum.
-        float sum = biasW[o_c];
-
-        // Accumulate along the filter depth.
-        for (size_t f_c = 0; f_c < inWdims[3]; f_c++) {
-          sum += (*filterW++) * (*inW++);
-        }
-
-        // Reset input pointer for next output channel.
-        inW -= inWdims[3];
-
-        // Store output.
-        *outW++ = sum;
-      }
-
-      // Advance input pointer for next output depth column.
-      inW += inWdims[3];
-
-      // Reset filter pointer for next output depth column.
-      filterW -= filterWdims[0] * filterWdims[1] * filterWdims[2] * filterWdims[3];
-    }
-  } // N
+  libjit_mat_mul_v2_f(outW,                        // outPtr
+                      inW,                         // inpPtr
+                      filterW,                     // fltPtr
+                      biasW,                       // biasPtr
+                      inWdims[0],                  // batchNum
+                      outWdims[1] * outWdims[2],   // inpNum
+                      outWdims[3],                 // fltNum
+                      inWdims[3],                  // vecLen
+                      outWdims[3]                  // fltNumGrp
+                      );
 }
 
+// -----------------------------------------------------------------------------
+//                              Depthwise Convolution
+// -----------------------------------------------------------------------------
 // Kernel limitations:
 // - dilations are 1
 // - group = inpC = outC
+// -----------------------------------------------------------------------------
 void libjit_conv2d_dw_f(float *outW, const float *inW, const float *filterW,
                         const float *biasW, const dim_t *outWdims,
                         const dim_t *inWdims, const dim_t *filterWdims,
@@ -866,13 +1080,13 @@ void libjit_conv2d_dw_f(float *outW, const float *inW, const float *filterW,
           // Advance pointers for next output channel.
           fltPtr = fltPtrSave + (o_c + 1) * kernelH * kernelW;
           inpPtr = inpPtrSave + (o_c + 1) * 1;
-        } // C
-      } // W
-    } // H
+        }
+      }
+    }
 
     // Advance input pointer for next batch.
-    inW  += inWdims [1] * inWdims [2] * inWdims [3];
-  } // N
+    inW += inWdims [1] * inWdims [2] * inWdims [3];
+  }
 }
 
 #endif
