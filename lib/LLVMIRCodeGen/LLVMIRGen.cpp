@@ -2149,15 +2149,43 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
 
       if (CI->getKernels()[0] == 1 && CI->getKernels()[1] == 1) {
 
-        auto outputH = dest->dims()[1];
-        auto outputW = dest->dims()[2];
-        auto outputC = dest->dims()[3];
+        auto inpNum = dest->dims()[1] * dest->dims()[2];
+        auto fltNum = dest->dims()[3];
+        auto vecLen = src ->dims()[3];
 
-        if (outputH * outputW < outputC) {
+        // Choose kernel.
+        if ((inpNum == 4096) || (inpNum == 1)) {
           F = getFunction("conv2d_1x1_v1", dest->getElementType());
         } else {
           F = getFunction("conv2d_1x1_v2", dest->getElementType());
         }
+
+        // Choose tiling param.
+        unsigned numGrp = 0;
+        if ((inpNum == 4096) && (vecLen ==   8) && (fltNum ==   16)) numGrp = 5;
+        if ((inpNum == 1024) && (vecLen ==  16) && (fltNum ==   32)) numGrp = 16;
+        if ((inpNum == 1024) && (vecLen ==  32) && (fltNum ==   32)) numGrp = 32;
+        if ((inpNum ==  256) && (vecLen ==  32) && (fltNum ==   64)) numGrp = 64;
+        if ((inpNum ==  256) && (vecLen ==  64) && (fltNum ==   64)) numGrp = 64;
+        if ((inpNum ==   64) && (vecLen ==  64) && (fltNum ==  128)) numGrp = 1 ;
+        if ((inpNum ==   64) && (vecLen == 128) && (fltNum ==  128)) numGrp = 16;
+        if ((inpNum ==   64) && (vecLen == 128) && (fltNum ==  128)) numGrp = 16;
+        if ((inpNum ==   64) && (vecLen == 128) && (fltNum ==  128)) numGrp = 16;
+        if ((inpNum ==   64) && (vecLen == 128) && (fltNum ==  128)) numGrp = 16;
+        if ((inpNum ==   64) && (vecLen == 128) && (fltNum ==  128)) numGrp = 16;
+        if ((inpNum ==   16) && (vecLen == 128) && (fltNum ==  256)) numGrp = 1 ;
+        if ((inpNum ==   16) && (vecLen == 256) && (fltNum ==  256)) numGrp = 1 ;
+        if ((inpNum ==    1) && (vecLen == 256) && (fltNum == 1001)) numGrp = 1;
+        assert(numGrp != 0 && "Case missed!");
+        unrollD = emitConstI32(builder, numGrp);
+
+        //if (outputH * outputW < outputC) {
+        //  F = getFunction("conv2d_1x1_v1", dest->getElementType());
+        //} else {
+        //  F = getFunction("conv2d_1x1_v2", dest->getElementType());
+        //}
+
+        //F = getFunction("conv2d_1x1_v2", dest->getElementType());
 
       }
 

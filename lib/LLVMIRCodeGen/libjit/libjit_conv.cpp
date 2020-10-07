@@ -939,6 +939,8 @@ void libjit_mat_mul_v2_f(      float *outPtr,
   }
 }
 
+#define CACHE_SIZE 8000
+
 // -----------------------------------------------------------------------------
 //                              1x1 Convolution V1
 // -----------------------------------------------------------------------------
@@ -956,6 +958,18 @@ void libjit_conv2d_1x1_v1_f(float *outW, const float *inW, const float *filterW,
                             const dim_t *biasWdims, const dim_t *kernelSizes,
                             const dim_t *strides, const dim_t *pads, dim_t group,
                             unsigned depthUnroll, dim_t dilation) {
+
+  // Cache optimization.
+  // (inpNumGrp+1)*N*4 < cache size where N is vector length
+  // inpNumGrp < cache / 4 / N - 1
+  //int32_t inpNum = outWdims[1] * outWdims[2];
+  //int32_t vecLen = inWdims[3];
+  //int32_t inpNumGrp = CACHE_SIZE / 4 / vecLen - 1;
+  //if (inpNumGrp < 1)
+  //  inpNumGrp = 1;
+  //if (inpNumGrp > inpNum)
+  //  inpNumGrp = inpNum;
+
   libjit_mat_mul_v1_f(outW,                       // outW
                       inW,                        // inpPtr
                       filterW,                    // fltPtr
@@ -964,7 +978,7 @@ void libjit_conv2d_1x1_v1_f(float *outW, const float *inW, const float *filterW,
                       outWdims[1] * outWdims[2],  // inpNum
                       outWdims[3],                // fltNum
                       inWdims[3],                 // vecLen
-                      outWdims[1] * outWdims[2]   // inpNumGrp
+                      depthUnroll                 // inpNumGrp
                      );
 }
 
@@ -985,6 +999,18 @@ void libjit_conv2d_1x1_v2_f(float *outW, const float *inW, const float *filterW,
                             const dim_t *biasWdims, const dim_t *kernelSizes,
                             const dim_t *strides, const dim_t *pads, dim_t group,
                             unsigned depthUnroll, dim_t dilation) {
+
+  // Cache optimization.
+  // (fltNumGrp+1)*N*4 < cache size where N is vector length
+  // fltNumGrp < cache / 4 / N - 1
+  //int32_t fltNum = outWdims[3];
+  //int32_t vecLen = inWdims[3];
+  //int32_t fltNumGrp = CACHE_SIZE / 4 / vecLen - 1;
+  //if (fltNumGrp < 1)
+  //  fltNumGrp = 1;
+  //if (fltNumGrp > fltNum)
+  //  fltNumGrp = fltNum;
+
   libjit_mat_mul_v2_f(outW,                        // outPtr
                       inW,                         // inpPtr
                       filterW,                     // fltPtr
@@ -993,7 +1019,7 @@ void libjit_conv2d_1x1_v2_f(float *outW, const float *inW, const float *filterW,
                       outWdims[1] * outWdims[2],   // inpNum
                       outWdims[3],                 // fltNum
                       inWdims[3],                  // vecLen
-                      outWdims[3]                  // fltNumGrp
+                      depthUnroll                  // fltNumGrp
                       );
 }
 
