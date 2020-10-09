@@ -1134,6 +1134,7 @@ ONNXModelWriter::convertType(const Type &glowType) {
   case ElemKind::UInt8FusedQTy:
   case ElemKind::UInt8FusedFP16QTy:
   case ElemKind::UInt4FusedFP16QTy:
+  case ElemKind::UInt4FusedQTy:
   case ElemKind::UInt8QTy:
     return TensorType::UINT8;
   case ElemKind::Int16QTy:
@@ -2218,6 +2219,7 @@ DEF_ALL_WRITER_NODE(Rsqrt)
 DEF_ALL_WRITER_NODE(Reciprocal)
 DEF_ALL_WRITER_NODE(Sin)
 DEF_ALL_WRITER_NODE(Cos)
+DEF_ALL_WRITER_NODE(LSTMUnit)
 DEF_ALL_WRITER_NODE(Min)
 DEF_ALL_WRITER_NODE(Max)
 DEF_ALL_WRITER_NODE(Log)

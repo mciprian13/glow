@@ -281,7 +281,7 @@ class MockBackendCustomIRGen : public Backend {
           "CustomConvolutionInstruction", Dest__, Src, Filter, Bias,
           CN__->getKernels(), CN__->getStrides(), CN__->getPads(),
           CN__->getGroup(), CN__->getDilation(), CN__->getLayout(),
-          CN__->getFusedActivation());
+          CN__->getFusedActivation(), {});
       if (N->hasPredicate()) {
         V->setPredicate(irgen.valueForNode(N->getPredicate()));
       }
@@ -353,6 +353,10 @@ unsigned countNodeKind(Function *F, Kinded::Kind kind);
 
 void inferConvNet(Tensor *inputs, Tensor *filter, Tensor *bias, Tensor *out,
                   llvm::StringRef kind);
+
+int inferConvReluNet(Tensor *inputs, Tensor *filter, Tensor *bias, Tensor *out,
+                     unsigned_t kernel, unsigned_t stride, unsigned_t pad,
+                     llvm::StringRef kind);
 
 void trainConvNet(Tensor *inputs, Tensor *kernel1, Tensor *bias1,
                   Tensor *kernel2, Tensor *bias2, Tensor *selected,

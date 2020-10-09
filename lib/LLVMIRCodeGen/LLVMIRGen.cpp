@@ -247,6 +247,8 @@ llvm::Type *LLVMIRGen::getElementType(llvm::IRBuilder<> &builder,
     return builder.getInt8Ty();
   case ElemKind::UInt4FusedFP16QTy:
     return builder.getInt8Ty();
+  case ElemKind::UInt4FusedQTy:
+    return builder.getInt8Ty();
   case ElemKind::BoolTy:
     static_assert(sizeof(bool) == sizeof(int8_t),
                   "Bool is expected to be the same size as int8.");
@@ -380,6 +382,9 @@ llvm::Value *LLVMIRGen::emitValueAddress(llvm::IRBuilder<> &builder,
   case ElemKind::UInt4FusedFP16QTy:
     T = llvm::Type::getInt8PtrTy(getLLVMContext());
     break;
+  case ElemKind::UInt4FusedQTy:
+    T = llvm::Type::getInt8PtrTy(getLLVMContext());
+    break;
   case ElemKind::BoolTy:
     T = llvm::Type::getInt8PtrTy(getLLVMContext());
     break;
@@ -462,6 +467,15 @@ LLVMIRGen::emitConstOffsetsArray(llvm::IRBuilder<> &builder,
   return constArrayVar;
 }
 
+llvm::Value *LLVMIRGen::emitConstI32Array(llvm::IRBuilder<> &builder,
+                                          llvm::ArrayRef<int32_t> vals) {
+  std::vector<llvm::Constant *> elems;
+  for (auto I : vals) {
+    elems.push_back(builder.getInt32(I));
+  }
+  return emitConstArray(builder, elems, builder.getInt32Ty());
+}
+
 llvm::Value *LLVMIRGen::emitConstFloatArray(llvm::IRBuilder<> &builder,
                                             llvm::ArrayRef<float> vals) {
   std::vector<llvm::Constant *> elems;
@@ -501,6 +515,59 @@ llvm::Value *LLVMIRGen::emitValueDims(llvm::IRBuilder<> &builder,
                                       const glow::Value *val) {
   auto dims = val->dims();
   return emitConstDimTArray(builder, dims);
+}
+
+template <class InstructionTy>
+llvm::Value *LLVMIRGen::emitConstFloatActivationArgs(llvm::IRBuilder<> &builder,
+                                                     const InstructionTy *I) {
+  return emitConstFloatArray(builder, I->getFusedActivationArgs());
+}
+
+template <class InstructionTy>
+llvm::Value *LLVMIRGen::emitConstQuantActivationArgs(llvm::IRBuilder<> &builder,
+                                                     const InstructionTy *I) {
+  auto actArgsF = I->getFusedActivationArgs();
+  std::vector<int32_t> actArgsQ;
+  auto *destTy = I->getDest()->getType();
+  switch (I->getFusedActivation()) {
+  case FusedActivation::NONE:
+  case FusedActivation::RELU:
+    assert(actArgsF.size() == 0 && "Invalid number of activation parameters!");
+    break;
+  case FusedActivation::CLIP: {
+    // For Clip we quantize min/max using the output quantization params.
+    assert(actArgsF.size() == 2 &&
+           "Invalid number of parameters for fused Clip activation!");
+    float minF = actArgsF[0];
+    float maxF = actArgsF[1];
+    TensorQuantizationParams TQP{destTy->getScale(), destTy->getOffset()};
+    int32_t minQ = quantization::quantize<int32_t>(minF, TQP);
+    int32_t maxQ = quantization::quantize<int32_t>(maxF, TQP);
+    actArgsQ.push_back(minQ);
+    actArgsQ.push_back(maxQ);
+    break;
+  }
+  case FusedActivation::SIGMOID:
+    LOG(FATAL) << "Fused Sigmoid for quantized type not supported!";
+    break;
+  case FusedActivation::TANH:
+    LOG(FATAL) << "Fused Tanh for quantized type not supported!";
+    break;
+  case FusedActivation::LEAKY_RELU: {
+    // For LeakyRelu we transform the alpha parameter into pre/post/scale.
+    assert(actArgsF.size() == 1 &&
+           "Invalid number of parameters for fused LeakyRelu activation!");
+    float alpha = actArgsF[0];
+    auto alphaScaleParam = quantization::quantizeScaleOffset32To8(alpha, 0);
+    actArgsQ.push_back(alphaScaleParam.pre);
+    actArgsQ.push_back(alphaScaleParam.post);
+    actArgsQ.push_back(alphaScaleParam.scale);
+    break;
+  }
+  default:
+    LOG(FATAL) << "Unsupported fused activation type!";
+  }
+  return emitConstI32Array(builder, actArgsQ);
 }
 
 llvm::Value *LLVMIRGen::emitValueSize(llvm::IRBuilder<> &builder,
@@ -558,6 +625,8 @@ llvm::Value *LLVMIRGen::emitConst(llvm::IRBuilder<> &builder, float val,
   case ElemKind::UInt8FusedFP16QTy:
     return builder.getInt8(static_cast<int8_t>(val));
   case ElemKind::UInt4FusedFP16QTy:
+    return builder.getInt8(static_cast<int8_t>(val));
+  case ElemKind::UInt4FusedQTy:
     return builder.getInt8(static_cast<int8_t>(val));
   case ElemKind::BoolTy:
     return builder.getInt8(static_cast<int8_t>(val));
@@ -2066,8 +2135,6 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
     auto *CI = cast<ConvolutionInst>(I);
     assert(CI->getLayout() == NHWC &&
            "Glow CPU Backend supports only NHWC Convolutions");
-    assert(CI->getFusedActivation() == FusedActivation::NONE &&
-           "Glow CPU Backend does not support fused activations.");
     auto *dest = CI->getDest();
     auto *src = CI->getSrc();
     auto *filter = CI->getFilter();
@@ -2104,6 +2171,8 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
 
     auto *unrollD = emitConstI32(builder, unrollDFactor);
 
+    auto *actType = emitConstI32(builder, CI->getFusedActivation());
+
     if (src->getType()->isQuantizedType()) {
       auto *destTy = dest->getType();
       auto *srcTy = src->getType();
@@ -2134,16 +2203,23 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
       auto *outPost = emitConstI32(builder, outScaleParam.post);
       auto *outScale = emitConstI32(builder, outScaleParam.scale);
 
+      // Emit parameters for fused activation.
+      auto *actArgsQuant = emitConstQuantActivationArgs(builder, CI);
+
       auto *F = getFunction("conv2d",
                             {dest->getElementType(), bias->getElementType()});
 
       createCall(builder, F,
-                 {destPtr,    srcPtr,     filterPtr,  biasPtr,   destDims,
-                  srcDims,    filterDims, biasDims,   kernels,   strides,
-                  pads,       group,      destOffset, srcOffset, filterOffset,
-                  biasOffset, biasPre,    biasPost,   biasScale, outPre,
-                  outPost,    outScale,   unrollD,    dilation});
+                 {destPtr,     srcPtr,     filterPtr,  biasPtr,   destDims,
+                  srcDims,     filterDims, biasDims,   kernels,   strides,
+                  pads,        group,      destOffset, srcOffset, filterOffset,
+                  biasOffset,  biasPre,    biasPost,   biasScale, outPre,
+                  outPost,     outScale,   unrollD,    dilation,  actType,
+                  actArgsQuant});
     } else {
+
+      // Emit parameters for fused activation.
+      auto *actArgsFloat = emitConstFloatActivationArgs(builder, CI);
 
       auto *F = getFunction("conv2d", dest->getElementType());
 
@@ -2196,7 +2272,7 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
       createCall(builder, F,
                  {destPtr, srcPtr, filterPtr, biasPtr, destDims, srcDims,
                   filterDims, biasDims, kernels, strides, pads, group, unrollD,
-                  dilation});
+                  dilation, actType, actArgsFloat});
     }
     break;
   }

@@ -310,10 +310,14 @@ template <> struct AttributeRetriever<false, FusedActivation> {
       return FusedActivation::NONE;
     } else if (str == "RELU") {
       return FusedActivation::RELU;
+    } else if (str == "CLIP") {
+      return FusedActivation::CLIP;
     } else if (str == "TANH") {
       return FusedActivation::TANH;
     } else if (str == "SIGMOID") {
       return FusedActivation::SIGMOID;
+    } else if (str == "LEAKY_RELU") {
+      return FusedActivation::LEAKY_RELU;
     } else {
       return MAKE_ERR("Invalid FusedActivation");
     }
@@ -1185,6 +1189,60 @@ static void helperSetter(Constant *constT, std::vector<datatype> &vec) {
   }
 }
 
+template <typename T>
+Error ONNXModelLoader::getRange(const ONNX_NAMESPACE::NodeProto &op,
+                                Constant *constT) {
+  T start = constT->getPayload().getHandle<T>().raw(0);
+
+  ASSIGN_VALUE_OR_RETURN_ERR(constT, getConstantByName(op.input(1)));
+  T limit = constT->getPayload().getHandle<T>().raw(0);
+
+  ASSIGN_VALUE_OR_RETURN_ERR(constT, getConstantByName(op.input(2)));
+  T delta = constT->getPayload().getHandle<T>().raw(0);
+
+  std::vector<T> rangeValues;
+  if (limit > start) {
+    RETURN_ERR_IF_NOT(delta > 0, "delta should be positive");
+    auto i = start;
+    while (i < limit) {
+      rangeValues.push_back(i);
+      i += delta;
+    }
+  } else if (limit < start) {
+    RETURN_ERR_IF_NOT(delta < 0, "delta should be negative");
+    auto i = start;
+    while (i > limit) {
+      rangeValues.push_back(i);
+      i += delta;
+    }
+  } else {
+    RETURN_ERR("limit and start value should be different");
+  }
+
+  Tensor rangeTensor(constT->getElementType(),
+                     {static_cast<unsigned int>(rangeValues.size())});
+  rangeTensor.getHandle<T>() = rangeValues;
+  RETURN_IF_ERR(
+      createAndRegisterConstant(op.output(0), std::move(rangeTensor)));
+  return Error::success();
+}
+
+Error ONNXModelLoader::loadRange(const ONNX_NAMESPACE::NodeProto &op,
+                                 ArgumentDictionaryTy &dict) {
+  Constant *constT;
+  ASSIGN_VALUE_OR_RETURN_ERR(constT, getConstantByName(op.input(0)));
+  auto glowType = constT->getElementType();
+  if (glowType == ElemKind::Int64ITy) {
+    return getRange<int64_t>(op, constT);
+  } else if (glowType == ElemKind::Int32ITy) {
+    return getRange<int32_t>(op, constT);
+  } else if (glowType == ElemKind::FloatTy) {
+    return getRange<float>(op, constT);
+  } else {
+    RETURN_ERR("Data type not supported");
+  }
+}
+
 Error ONNXModelLoader::loadSlice(const ONNX_NAMESPACE::NodeProto &op,
                                  ArgumentDictionaryTy &dict) {
   const std::string &opName = loadOperatorName(op);
@@ -1247,11 +1305,8 @@ Error ONNXModelLoader::loadSlice(const ONNX_NAMESPACE::NodeProto &op,
                           axesC->getType()->getElementName().str().c_str())));
       }
 
-      RETURN_ERR_IF_NOT(
-          op.input_size() == 5,
-          opErrMsg(op, strFormat("Steps is not currently supported."
-                                 " but found stepo step size %d ",
-                                 op.input_size())));
+      RETURN_ERR_IF_NOT(op.input_size() == 4,
+                        opErrMsg(op, "Steps is not currently supported!"));
     }
   } else {
     // Attributes 'starts' and 'ends' are mandatory and must be consistent.
@@ -4421,6 +4476,9 @@ Error ONNXModelLoader::loadOperator(const ONNX_NAMESPACE::NodeProto &op) {
 
   if (typeName == "Constant") {
     return loadConstant(op, dict);
+  }
+  if (typeName == "Range") {
+    return loadRange(op, dict);
   }
   if (typeName == "Slice") {
     return loadSlice(op, dict);

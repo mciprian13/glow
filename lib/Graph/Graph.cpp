@@ -852,7 +852,7 @@ ConvolutionNode *Function::createConv(
 
   return addNode(new ConvolutionNode(name, OT, input, filter, bias, kernels,
                                      strides, pads, group, dilation, layout,
-                                     FusedActivation::NONE));
+                                     FusedActivation::NONE, {}));
 }
 
 ConvolutionNode *Function::createConv(llvm::StringRef name, NodeValue input,
@@ -1375,9 +1375,11 @@ Node *Function::createBroadcast(llvm::StringRef name, NodeValue input,
 }
 
 /// \returns true if \p T1 and T2 has the exact same type except for dimension
-/// \p dim.
+/// \p dim. It will log an error when returning false.
 static bool sameSameShapeExceptDim(TypeRef T1, TypeRef T2, unsigned dim) {
   if (T1->getElementType() != T2->getElementType()) {
+    LOG(ERROR) << "Different types " << (int)T1->getElementType() << " "
+               << (int)T2->getElementType();
     return false;
   }
 
@@ -1385,6 +1387,7 @@ static bool sameSameShapeExceptDim(TypeRef T1, TypeRef T2, unsigned dim) {
   auto D2 = T2->dims();
 
   if (D1.size() != D2.size()) {
+    LOG(ERROR) << "Different size " << D1.size() << " " << D2.size();
     return false;
   }
 
@@ -1395,6 +1398,8 @@ static bool sameSameShapeExceptDim(TypeRef T1, TypeRef T2, unsigned dim) {
     }
 
     if (D1[i] != D2[i]) {
+      LOG(ERROR) << "Different dimension at " << i << " " << D1[i] << " "
+                 << D2[i];
       return false;
     }
   }
@@ -2137,15 +2142,18 @@ getOutputTypeOfFusedRowwiseQuantizedSLS(Function *F, NodeValue data,
   // fused.
   CHECK(isFusedQuantizedElemKind(data.getElementType()))
       << "Must use a fused ElemKind for data.";
-  outDims[1] -= 2 * ((data.getElementType() == ElemKind::UInt8FusedQTy)
+  outDims[1] -= 2 * ((data.getElementType() == ElemKind::UInt8FusedQTy ||
+                      data.getElementType() == ElemKind::UInt4FusedQTy)
                          ? sizeof(float)
                          : sizeof(float16_t));
   // If using 4-bit quantization, then the input data has packed two 4-bit
   // elements into one byte, so we need to double the outDims.
-  if (data.getElementType() == ElemKind::UInt4FusedFP16QTy) {
+  if (data.getElementType() == ElemKind::UInt4FusedFP16QTy ||
+      data.getElementType() == ElemKind::UInt4FusedQTy) {
     outDims[1] *= 2;
   }
-  const ElemKind outputK = (data.getElementType() == ElemKind::UInt8FusedQTy)
+  const ElemKind outputK = (data.getElementType() == ElemKind::UInt8FusedQTy ||
+                            data.getElementType() == ElemKind::UInt4FusedQTy)
                                ? ElemKind::FloatTy
                                : ElemKind::Float16Ty;
   return F->getParent()->uniqueType(outputK, outDims);
@@ -2217,6 +2225,18 @@ static Constant *quantizeDataForFusedRowwiseQuantizedSparseLengthsWeightedSum(
     Constant *rwqData = F->getParent()->createConstant(
         precision, {fDims.first, outerDim}, 0.0, 0, "data");
     quantization::tensorFusedRowwiseQuantization<float16_t>(
+        fData, rwqData->getPayloadMutable());
+    return rwqData;
+  }
+  case ElemKind::UInt4FusedQTy: {
+    // We pack 4-bit values into bytes, so given the input size in float we
+    // divide by two and take the ceiling to make sure we have enough space for
+    // all elements.
+    const dim_t outerDim =
+        std::ceil(((float)fDims.second) / 2) + 2 * sizeof(float);
+    Constant *rwqData = F->getParent()->createConstant(
+        precision, {fDims.first, outerDim}, 0.0, 0, "data");
+    quantization::tensorFusedRowwiseQuantization<float>(
         fData, rwqData->getPayloadMutable());
     return rwqData;
   }
@@ -2867,7 +2887,7 @@ ConvolutionNode *Function::createConv(
 
   return addNode(new ConvolutionNode(name, OT, input, filter, bias, kernels,
                                      strides, pads, group, dilation, layout,
-                                     FusedActivation::NONE));
+                                     FusedActivation::NONE, {}));
 }
 
 ConvolutionNode *Function::createConv(PlaceholderBindings &bindings,
@@ -3473,6 +3493,65 @@ void Function::createSimpleRNN(PlaceholderBindings &bindings,
     Ht = H;
   };
 }
+
+LSTMUnitNode *Function::createLSTMUnit(llvm::StringRef namePrefix,
+                                       NodeValue Input, NodeValue C) {
+
+  return addNode(new LSTMUnitNode(namePrefix, Input, C));
+}
+
+void Function::createPyTorchLSTM(llvm::StringRef namePrefix, NodeValue input,
+                                 NodeValue Wx, NodeValue Wh, NodeValue Bx,
+                                 NodeValue Bh, NodeValue &Ht, NodeValue &Ct,
+                                 NodeValue &output, bool isBidirectional) {
+  std::string nameBase = namePrefix;
+  assert(isBidirectional == false && "bidirectional is not supported yet");
+  assert(input.dims().back() > 0 && "input dimensionality is zero");
+
+  auto name = [&nameBase](const char *s, int t) {
+    return strFormat("%s.%s_%d", nameBase.c_str(), s, t);
+  };
+  std::vector<NodeValue> inputs, outputs;
+  unsigned batchSize, hiddenSize, timeSteps;
+  batchSize = input.dims()[1];
+  hiddenSize = input.dims()[2];
+  timeSteps = input.dims()[0];
+  // Input gate:
+  //    I <- sigmoid(Wxi * x + Bxi + Whi * h + Bhi)
+  // Forget gate:
+  //    F <- sigmoid(Wxf * x + Bxf + Whf * h + Bhf)
+  // Cell gate:
+  //    G <- tanh(Wxg * x + Bxg + Whg * h + Bhg)
+  // Output gate:
+  //    O <- sigmoid(Wxo * x + Bxo + Who * h + Bho)
+  // Cell state:
+  //    C <- F . C + I . G
+  // Hidden state:
+  //    h <- O . tanh(C)
+
+  std::vector<Node *> outputNodes;
+  for (unsigned t = 0; t < timeSteps; t++) {
+    auto inputSliced = createSlice(name("slice", t), input, {t, 0, 0},
+                                   {t + 1, batchSize, hiddenSize})
+                           ->getResult();
+    inputSliced =
+        createReshape(name("reshape", t), inputSliced, {batchSize, hiddenSize});
+    auto *Result = createAdd(
+        name("add1", t), createFullyConnected(name("fc1", t), Ht, Wh, Bh),
+        createFullyConnected(name("fc2", t), inputSliced, Wx, Bx));
+
+    auto lstmUnitNode =
+        addNode(new LSTMUnitNode(name("lstm_unit", t), Result, Ct));
+    Ht = lstmUnitNode->getNthResult(0);
+    Ct = lstmUnitNode->getNthResult(1);
+
+    auto reshaped =
+        createReshape("output_reshape", Ht, {1, Ht.dims()[0], Ht.dims()[1]})
+            ->getResult();
+    outputs.push_back(reshaped);
+  }
+  output = createConcat("output_cat", outputs, 0)->getResult();
+};
 
 void Function::createLSTM(PlaceholderBindings &bindings,
                           llvm::StringRef namePrefix,
@@ -4883,8 +4962,9 @@ BBoxTransformNode *Function::createBBoxTransform(
 
   auto boxOutTy = getParent()->uniqueTypeWithNewShape(
       rois.getType(), {deltasDims[0], deltasDims[1]});
+  // Forcing roiBatchSplitsTy to always be Float.
   auto roiBatchSplitsTy =
-      getParent()->uniqueType(rois.getElementType(), {imInfoDims[0]});
+      getParent()->uniqueType(ElemKind::FloatTy, {imInfoDims[0]});
 
   return addNode(new BBoxTransformNode(
       name, boxOutTy, roiBatchSplitsTy, rois, deltas, imInfo, weights,
@@ -5195,6 +5275,11 @@ void Function::randomizeConstants(
           std::numeric_limits<uint8_t>::max(), getPRNG());
       break;
     case ElemKind::UInt4FusedFP16QTy:
+      payload.getHandle<uint8_t>().randomize(
+          std::numeric_limits<uint8_t>::lowest(),
+          std::numeric_limits<uint8_t>::max(), getPRNG());
+      break;
+    case ElemKind::UInt4FusedQTy:
       payload.getHandle<uint8_t>().randomize(
           std::numeric_limits<uint8_t>::lowest(),
           std::numeric_limits<uint8_t>::max(), getPRNG());

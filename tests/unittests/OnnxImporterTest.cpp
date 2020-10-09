@@ -1211,6 +1211,55 @@ TEST_F(OnnxImporterTest, importConvTransposeOutputShape) {
   convTransposeTestHelper(filename, expectedDims, expectedValues);
 }
 
+/// Helper method to run the Range operator test cases.
+/// \p filename contains the model .onnxtxt.
+/// \p expectedDims: output Tensor dimensions.
+/// \p expectedValues : output Tensor values expected.
+template <typename T>
+static void rangeTestHelper(std::string &filename,
+                            llvm::ArrayRef<dim_t> expectedDims,
+                            llvm::ArrayRef<T> expectedValues) {
+  ExecutionEngine EE{};
+  auto &mod = EE.getModule();
+  Function *F = mod.createFunction("main");
+
+  std::string NetFilename =
+      std::string(GLOW_DATA_PATH "tests/models/onnxModels/") + filename;
+
+  PlaceholderBindings bindings;
+  Placeholder *output;
+  {
+    ONNXModelLoader onnxLD(NetFilename, {}, {}, *F);
+    output = EXIT_ON_ERR(onnxLD.getSingleOutput());
+    bindings.allocate(mod.getPlaceholders());
+    updateInputPlaceholdersByName(bindings, &mod, {}, {});
+  }
+  auto *res = bindings.get(output);
+  EE.compile(CompilationMode::Infer);
+  EE.run(bindings);
+  auto result = res->getHandle<T>();
+  EXPECT_TRUE(result.dims() == expectedDims);
+  for (dim_t i = 0, e = expectedValues.size(); i < e; i++) {
+    EXPECT_FLOAT_EQ(result.raw(i), expectedValues[i]);
+  }
+}
+
+/// Test loading Range with int32 datatype.
+TEST(onnx, importRangeInt32) {
+  std::string filename("RangeInt32.onnxtxt");
+  std::vector<dim_t> expectedDims = {2};
+  std::vector<int32_t> expectedValues = {10, 7};
+  rangeTestHelper<int32_t>(filename, expectedDims, expectedValues);
+}
+
+/// Test loading Range with float datatype.
+TEST(onnx, importRangeFloat) {
+  std::string filename("RangeFloat.onnxtxt");
+  std::vector<dim_t> expectedDims = {5};
+  std::vector<float> expectedValues = {0.0, 1.0, 2.0, 3.0, 4.0};
+  rangeTestHelper<float>(filename, expectedDims, expectedValues);
+}
+
 /// Test loading ConvTranspose, implicit kernel, multi-channel input/output,
 /// asymmetric kernel and pads.
 TEST(onnx, importDeconvAsymmetric) {
@@ -4729,6 +4778,42 @@ TEST_F(OnnxImporterTest, importGemmTransB) {
                           "tests/models/onnxModels/gemmTransB.onnxtxt");
   importGemm(netFilename, /* hasC */ true, /* batchedC */ false,
              /* transA */ false, /* transB */ true);
+}
+
+TEST(onnx, importTransposeNullPerm) {
+  ExecutionEngine EE;
+  auto &mod = EE.getModule();
+  std::string netFilename(
+      GLOW_DATA_PATH "tests/models/onnxModels/transpose_null_perm.onnxtxt");
+  auto *F = mod.createFunction("main");
+  PlaceholderBindings bindings;
+  Placeholder *output_0;
+
+  Tensor input_0(ElemKind::Int32ITy, {1, 2, 3, 4});
+  input_0.getHandle<int32_t>() = {1, 2, 3, 6, 4, 5, 6, 3, 1, 2, 3, 6,
+                                  4, 5, 6, 3, 7, 8, 9, 2, 3, 5, 7, 1};
+  {
+    ONNXModelLoader onnxLD(netFilename, {"X1"}, {&input_0.getType()}, *F);
+
+    output_0 = EXIT_ON_ERR(onnxLD.getOutputByName("output0"));
+
+    bindings.allocate(mod.getPlaceholders());
+    updateInputPlaceholdersByName(bindings, &mod, {"X1"}, {&input_0});
+  }
+
+  EE.compile(CompilationMode::Infer);
+  EE.run(bindings);
+
+  std::vector<dim_t> expectedDims = {4, 3, 2, 1};
+  std::vector<int32_t> expectedValues = {1, 4, 4, 7, 1, 3, 2, 5, 5, 8, 2, 5,
+                                         3, 6, 6, 9, 3, 7, 6, 3, 3, 2, 6, 1};
+
+  auto result = bindings.get(output_0)->getHandle<int32_t>();
+
+  EXPECT_EQ(result.dims().vec(), expectedDims);
+  for (dim_t i = 0; i < 24; i++) {
+    EXPECT_FLOAT_EQ(result.raw(i), expectedValues[i]);
+  }
 }
 
 TEST(onnx, importNames) {

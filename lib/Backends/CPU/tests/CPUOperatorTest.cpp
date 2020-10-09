@@ -331,6 +331,7 @@ std::set<std::string> glow::backendTestBlacklist = {
     "FP16BatchNorm2D/0",
     "LayerNorm_Float16/0",
     "LayerNorm_Int8/0",
+    "LSTMUnitFP16/0",
     "ChannelwiseQuantizedConv2D_NonZero_FloatBias/0",
     "DequantizeFRWQ_Float/0",
     "DequantizeFRWQ_Float16/0",
@@ -366,6 +367,10 @@ std::set<std::string> glow::backendTestBlacklist = {
     "BBoxTransform/0",
     "BasicFloorDivNetFloatVsFloat16/0",
     "ArithFloorDiv_float16_t/0",
+    "IntFloorDivBroadcast/0",
     "VectorNorm_BFloat16/0",
     "VectorNorm_Float16/0",
-    "VectorNorm_Float16Ty/0"};
+    "VectorNorm_Float16Ty/0",
+    "BBoxTransform_Float/0",
+    "BBoxTransform_Float16/0",
+};

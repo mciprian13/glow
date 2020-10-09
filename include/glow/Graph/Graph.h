@@ -1025,6 +1025,9 @@ public:
   DECLARE_BROADCAST_NODE_WITH_OUT_TYPE(Sub, /* NUM_INPUTS */ 2, outTy)
   DECLARE_BROADCAST_NODE_WITH_OUT_TYPE(Mul, /* NUM_INPUTS */ 2, outTy)
   DECLARE_BROADCAST_NODE_WITH_OUT_TYPE(Div, /* NUM_INPUTS */ 2, outTy)
+  DECLARE_BROADCAST_NODE_WITH_OUT_TYPE(FloorDiv, /* NUM_INPUTS */ 2, outTy)
+  DECLARE_BROADCAST_NODE_WITH_OUT_TYPE(Min, /* NUM_INPUTS */ 2, outTy)
+  DECLARE_BROADCAST_NODE_WITH_OUT_TYPE(Max, /* NUM_INPUTS */ 2, outTy)
 
 #define DECLARE_CMP_BROADCAST_NODE(NODE_NAME)                                  \
   template <class T, class... Args>                                            \
@@ -1738,6 +1741,26 @@ public:
                   const llvm::ArrayRef<NodeValue> inputs, unsigned batchSize,
                   unsigned hiddenSize, unsigned outputSize,
                   std::vector<NodeValue> &outputs);
+
+  /// Create an LSTM Unit Node with \p Input which shape is [batch,
+  /// 4*hiddenSize] and follow the order i, f, g, o, and \p C as current cell
+  /// state.
+  LSTMUnitNode *createLSTMUnit(llvm::StringRef namePrefix, NodeValue Input,
+                               NodeValue C);
+
+  /// Create PyTorch style LSTM with fixed weights and biases.
+  /// The order of \p Wx \p Wh \p Bx and \p Bh is i, f, g, o,
+  /// The \p inputs shape should be (numSteps, batchSize, hiddenSize),
+  /// while \p Wx shape should be (inputSize, hiddenSize * 4),
+  /// Wh shape should be (hiddenSize, hiddenSize * 4),
+  /// \p Bx and \p Bh shape should be (hiddenSize * 4).
+  /// \p Ht and \p Ct are initial hidden state and cell.
+  /// For more details, please read:
+  /// https://pytorch.org/docs/stable/generated/torch.nn.LSTM.html
+  void createPyTorchLSTM(llvm::StringRef namePrefix, NodeValue inputs,
+                         NodeValue Wx, NodeValue Wh, NodeValue Bx, NodeValue Bh,
+                         NodeValue &Ht, NodeValue &Ct, NodeValue &outputs,
+                         bool isBidirectional = false);
 
   /// Type definition for the direction of an RNN module (RNN, GRU, LSTM).
   enum class RnnDirection {

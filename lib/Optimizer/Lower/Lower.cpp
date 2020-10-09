@@ -173,9 +173,11 @@ static void lowerFloorDivNode(Function *F, CompilationContext &cctx,
   NodeValue LHS = node.getLHS();
   NodeValue RHS = node.getRHS();
 
-  auto *div = F->createDiv(DECORATE_NODE_NAME(node, "lhs", "rhs"), LHS, RHS);
+  auto *div = F->createDiv(DECORATE_NODE_NAME(node, "lhs", "rhs"),
+                           node.getResult().getType(), LHS, RHS);
 
-  auto *result = F->createFloor(DECORATE_NODE_NAME(node, "floor"), div);
+  auto *result = F->createFloor(DECORATE_NODE_NAME(node, "floor"),
+                                node.getResult().getType(), div);
 
   replaceAllUsesOfWith(cctx.loweredInfoMap, node.getResult(), result);
 }
@@ -1042,9 +1044,13 @@ static void lowerGroupConvolutionNode(Function *F, CompilationContext &cctx,
         {(groupId + 1) * outCperG, kdim.height, kdim.width, inCperG});
     auto *bias_slice = F->createSlice(BNG.getName(), bias, {groupId * outCperG},
                                       {(groupId + 1) * outCperG});
-    convs.push_back(F->createConv(BNG.getName(), in_slice, filter_slice,
-                                  bias_slice, outTy, kernels, strides, pads, 1,
-                                  BNG.getDilation()));
+
+    auto *conv =
+        F->createConv(BNG.getName(), in_slice, filter_slice, bias_slice, outTy,
+                      kernels, strides, pads, 1, BNG.getDilation());
+    conv->setFusedActivation(BNG.getFusedActivation());
+    conv->setFusedActivationArgs(BNG.getFusedActivationArgs());
+    convs.push_back(conv);
   }
   auto *result = F->createConcat(BNG.getName(), convs, 3);
   replaceAllUsesOfWith(cctx.loweredInfoMap, BNG.getResult(), result);
@@ -1661,6 +1667,42 @@ static void lowerGeluNode(Function *F, CompilationContext &cctx,
   replaceAllUsesOfWith(cctx.loweredInfoMap, GN.getResult(), mul4);
 }
 
+static void lowerLSTMUnitNode(Function *F, CompilationContext &cctx,
+                              const LSTMUnitNode &LUN) {
+  NodeValue input = LUN.getInput();
+  NodeValue inC = LUN.getC();
+
+  auto nameBase = LUN.getName().str();
+  auto name = [&nameBase](const char *s) {
+    return strFormat("%s.%s", nameBase.c_str(), s);
+  };
+  unsigned batchSize = input.dims()[0];
+  unsigned hiddenSize = input.dims()[1] / 4;
+
+  NodeValue inI =
+      F->createSlice(name("sliceI"), input, {0, 0}, {batchSize, hiddenSize});
+  NodeValue inF = F->createSlice(name("sliceF"), input, {0, hiddenSize},
+                                 {batchSize, 2 * hiddenSize});
+  NodeValue inG = F->createSlice(name("sliceG"), input, {0, 2 * hiddenSize},
+                                 {batchSize, 3 * hiddenSize});
+  NodeValue inO = F->createSlice(name("sliceO"), input, {0, 3 * hiddenSize},
+                                 {batchSize, 4 * hiddenSize});
+
+  inI = F->createSigmoid(name("sigmoid2"), inI);
+  inF = F->createSigmoid(name("sigmoid1"), inF);
+  inG = F->createTanh(name("tanh1"), inG);
+  inO = F->createSigmoid(name("sigmoid3"), inO);
+
+  auto newC = F->createAdd(name("addC"), F->createMul(name("mul1"), inF, inC),
+                           F->createMul(name("mul2"), inI, inG));
+
+  auto newH =
+      F->createMul(name("mulH"), inO, F->createTanh(name("tanh2"), newC));
+
+  replaceAllUsesOfWith(cctx.loweredInfoMap, LUN.getNthResult(0), newH);
+  replaceAllUsesOfWith(cctx.loweredInfoMap, LUN.getNthResult(1), newC);
+}
+
 bool glow::lowerNode(Function *F, Node *node, CompilationContext &cctx) {
 #define CASE_LOWER(NODE_NAME_)                                                 \
   case Kinded::Kind::NODE_NAME_##NodeKind:                                     \
@@ -1709,9 +1751,10 @@ bool glow::lowerNode(Function *F, Node *node, CompilationContext &cctx) {
     CASE_LOWER(Gelu);
     CASE_LOWER(FloorDiv);
     CASE_LOWER(BatchedMul);
+    CASE_LOWER(LSTMUnit);
   case Kinded::Kind::ConvolutionNodeKind: {
     ConvolutionNode *CN = cast<ConvolutionNode>(node);
-    if (CN->getGroup() > 1 && CN->hasFusedActivation()) {
+    if (CN->getGroup() > 1) {
       lowerGroupConvolutionNode(F, cctx, *CN);
       return true;
     }

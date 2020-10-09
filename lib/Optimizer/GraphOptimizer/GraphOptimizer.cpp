@@ -46,10 +46,11 @@
 
 llvm::cl::OptionCategory graphOptCat("Graph Optimizations Options");
 llvm::cl::opt<unsigned> constDedupSizeOpt(
-    "const_dedup_size",
+    "const-dedup-size",
     llvm::cl::desc(
-        "Max number of elements allowed for deduplicating Constants"),
-    llvm::cl::Optional, llvm::cl::init(256), llvm::cl::cat(graphOptCat));
+        "Max number of elements allowed for deduplicating Constants. "
+        "A value equal to 0 means no limit. Default is 0."),
+    llvm::cl::Optional, llvm::cl::init(0), llvm::cl::cat(graphOptCat));
 
 using namespace glow;
 using llvm::cast;
@@ -1253,6 +1254,9 @@ bool MergePadIntoConvolution::run(Function *F, const CompilationContext &cctx) {
                                 CN->getBias(), CN->getResult().getType(),
                                 CN->getKernels(), CN->getStrides(), newConvPads,
                                 CN->getGroup(), CN->getDilation());
+    newCN->setFusedActivation(CN->getFusedActivation());
+    newCN->setFusedActivationArgs(CN->getFusedActivationArgs());
+
     CN->getResult().replaceAllUsesOfWith(newCN);
     changed = true;
   }
@@ -1368,13 +1372,7 @@ bool MergeTransposeIntoMatMulOrFC::run(Function *F,
 /// are consecutive but Slice(0..10) Slice(20..30) are not.
 static bool areSlicesConsecutive(SliceNode *A, SliceNode *B, unsigned_t dim) {
   // The slices must extract from the same input.
-  if (A->getInput().getNode() != B->getInput().getNode()) {
-    return false;
-  }
-
-  // The result element type must be identical.
-  if (A->getResult().getType()->getElementType() !=
-      B->getResult().getType()->getElementType()) {
+  if (A->getInput() != B->getInput()) {
     return false;
   }
 
@@ -1405,6 +1403,26 @@ static bool areSlicesConsecutive(SliceNode *A, SliceNode *B, unsigned_t dim) {
   }
 
   return true;
+}
+
+/// \returns True if the two slices \p A and \p B access consecutive spacial
+/// regions along some dimension. The dimension is stored in \p dim.
+/// For example, Slice((0, 0)..(1, 10)) Slice((1, 0)..(2, 10)) are consecutive
+/// along dim=0.
+static bool findConsecutiveSliceDim(SliceNode *A, SliceNode *B, int *dim) {
+  // The slices must extract from the same input.
+  if (A->getInput() != B->getInput()) {
+    return false;
+  }
+
+  for (size_t i = 0, e = A->getStart().size(); i < e; i++) {
+    if (areSlicesConsecutive(A, B, i)) {
+      *dim = i;
+      return true;
+    }
+  }
+
+  return false;
 }
 
 bool ConvertBroadcastedBatchMatMul::run(Function *F,
@@ -2580,70 +2598,136 @@ bool EliminateSliceConcat::run(Function *F, const CompilationContext &cctx) {
     // 2) merging Slices from different sources
     // e.g. Slice(A1)-Slice(B1)-Slice(A2)-Slice(B2), A1 and A2, B1 and B2 are
     // consecutive respectively
-    std::vector<std::vector<SliceNode *>> consecutiveSlices;
+    //
+    // Store consecutive slices along *any* dimension. If the consecutive
+    // slices' dimension is the same as the concat, the concat can be removed.
+    // If the slices' dimension is different from the concat, the nodes
+    // can be replaced with slice+reshape OR slice+transpose+reshape.
+    // The extra transpose is needed when the consecutive dimension is
+    // after the concat dimension.
+    std::vector<
+        std::pair<int /* dimension of slicing */, std::vector<SliceNode *>>>
+        consecutiveSlices;
     std::vector<SliceNode *> currConsecutiveSlices;
     SliceNode *lastSN = nullptr;
+    int lastDim = -1;
     for (auto &concatInput : CN->getInputs()) {
       auto *SN = dyn_cast<SliceNode>(concatInput.getNode());
       // slices with multiple users will not be considered
       if (!SN || SN->getResult().getNumUsers() > 1) {
         if (currConsecutiveSlices.size()) {
-          consecutiveSlices.emplace_back(currConsecutiveSlices);
+          consecutiveSlices.emplace_back(lastDim, currConsecutiveSlices);
           currConsecutiveSlices.clear();
         }
+        lastDim = -1;
         lastSN = nullptr;
         continue;
       }
       // slices with different sources will not be considered
+      int dim = -1;
       if (lastSN && (lastSN->getInput() != SN->getInput() ||
-                     !areSlicesConsecutive(lastSN, SN, CN->getDim()))) {
-        consecutiveSlices.emplace_back(currConsecutiveSlices);
+                     !findConsecutiveSliceDim(lastSN, SN, &dim))) {
+        consecutiveSlices.emplace_back(lastDim, currConsecutiveSlices);
         currConsecutiveSlices.clear();
       }
+      lastDim = dim;
       lastSN = SN;
       currConsecutiveSlices.emplace_back(SN);
     }
     if (currConsecutiveSlices.size()) {
-      consecutiveSlices.emplace_back(currConsecutiveSlices);
+      consecutiveSlices.emplace_back(lastDim, currConsecutiveSlices);
     }
 
-    // Mapping from old Slices to new Slices where the range of each old Slice
-    // is a subset of the corresponding new Slice
-    std::unordered_map<SliceNode *, SliceNode *> oldToNewSlices;
-    for (const auto &slices : consecutiveSlices) {
+    // Mapping from old Slices to new Nodes where a Node can either be
+    // i) a merged Slice
+    // ii) a merged Slice + Reshape
+    // iii) a merged Slice + Transpose + Reshape
+    std::unordered_map<SliceNode *, Node *> oldSlicesToNewNodes;
+
+    for (const auto &slicePairs : consecutiveSlices) {
+      auto slicesDim = slicePairs.first;
+      auto &slices = slicePairs.second;
+
       if (slices.size() <= 1) {
         continue;
       }
+      if (slicesDim != CN->getDim() &&
+          ((slicesDim != CN->getDim() + 1 && slicesDim != CN->getDim() - 1) ||
+           slices[0]->getResult().dims()[slicesDim] != 1)) {
+        // Optimizations are possible only if:
+        // 1) slices consecutive dimension is the same as concat dimension, or
+        // 2) slices consecutive dimension is adjacent to the concat dimension,
+        //    and the size of each slice along the consecutive dimension is 1.
+        //    NOTE: Checking the slicesDim dimension of 0th slice is
+        //    sufficient, as opposed to checking every slice. If the slices
+        //    can be concatenated (and they're being concatenated along a
+        //    different dimension), then each slicesDim dim must be equal.
+        continue;
+      }
+      if ((slicesDim == CN->getDim() + 1 && slices.size() <= 3) ||
+          (slicesDim == CN->getDim() - 1 && slices.size() <= 2)) {
+        // Optimization does not decrease the number of nodes.
+        continue;
+      }
+
       SliceNode *firstSlice = slices.front();
       auto *srcNode = firstSlice->getInput().getNode();
       std::vector<dim_t> endDims;
+
       for (size_t i = 0, e2 = firstSlice->getResult().dims().size(); i < e2;
            i++) {
         endDims.emplace_back(slices.back()->getStart()[i] +
                              slices.back()->getResult().dims()[i]);
       }
+      Node *newNode = nullptr;
       auto *newSlice = F->createSlice(firstSlice->getName(), srcNode,
                                       firstSlice->getStart(), endDims);
-      for (auto *slice : slices) {
-        oldToNewSlices[slice] = newSlice;
+
+      // Create a reshape node based on consecutive slice dimension and
+      // concat dimension.
+      if (slicesDim == CN->getDim() + 1 || slicesDim == CN->getDim() - 1) {
+        auto outputDimVec = newSlice->getResult().dims().vec();
+        outputDimVec[CN->getDim()] *= outputDimVec[slicesDim];
+        outputDimVec[slicesDim] = 1;
+        auto outputDims = llvm::makeArrayRef(outputDimVec);
+
+        Node *inputToReshape = nullptr;
+        if (slicesDim == CN->getDim() + 1) {
+          std::vector<unsigned_t> shuffle(outputDimVec.size());
+          std::iota(shuffle.begin(), shuffle.end(), 0);
+          std::swap(shuffle[slicesDim], shuffle[CN->getDim()]);
+          inputToReshape = F->createTranspose(
+              newSlice->getName().str() + "_Transpose", newSlice, shuffle);
+        } else {
+          inputToReshape = newSlice;
+        }
+        newNode = F->createReshape(newSlice->getName().str() + "_Reshape",
+                                   inputToReshape, outputDims);
+      } else {
+        newNode = newSlice;
       }
+
+      for (auto *slice : slices) {
+        oldSlicesToNewNodes[slice] = newNode;
+      }
+
       changed = true;
     }
-    if (!oldToNewSlices.size()) {
+    if (!oldSlicesToNewNodes.size()) {
       continue;
     }
-    // Replace the input Slices to CN with the merged Slices
+    // Replace the input Slices to CN with the merged Nodes.
     std::vector<NodeValue> newConcatInputs;
-    const SliceNode *lastNewSlice = nullptr;
+    const Node *lastNewNode = nullptr;
     for (const auto &concatInput : CN->getInputs()) {
       auto *SN = dyn_cast<SliceNode>(concatInput.getNode());
-      if (!SN || !oldToNewSlices.count(SN)) {
+      if (!SN || !oldSlicesToNewNodes.count(SN)) {
         newConcatInputs.emplace_back(concatInput);
       } else {
-        auto *newSlice = oldToNewSlices[SN];
-        if (newSlice != lastNewSlice) {
-          lastNewSlice = newSlice;
-          newConcatInputs.emplace_back(newSlice);
+        auto *newNode = oldSlicesToNewNodes[SN];
+        if (newNode != lastNewNode) {
+          lastNewNode = newNode;
+          newConcatInputs.emplace_back(newNode);
         }
       }
     }
@@ -2930,12 +3014,10 @@ static bool deduplicateConstants(Module *M) {
 
   bool changed = false;
   for (auto &C : M->getConstants()) {
-    // Only perform deduplication on consts of small enough size. Otherwise
-    // just skip them. constDedupSizeOpt defaults to 256 as a heuristic, to
-    // keep compile time reasonable.
+    // Only perform deduplication of consts with given max number of elements.
     size_t maxNumEls = constDedupSizeOpt;
     size_t numEls = C->getType()->size();
-    if (numEls > maxNumEls) {
+    if ((maxNumEls != 0) && (numEls > maxNumEls)) {
       continue;
     }
 
@@ -2965,7 +3047,10 @@ bool CSE::run(Function *F, const CompilationContext &cctx) {
   LOG_SCOPE(F->getLogContext(), getName());
   CSEVisitor visitor;
 
-  bool changed = deduplicateConstants(F->getParent());
+  bool changed = false;
+  if (cctx.optimizationOpts.enableConstantDeduplication) {
+    changed |= deduplicateConstants(F->getParent());
+  }
 
   // Perform CSE on all nodes.
   for (auto &N : F->getNodes()) {
@@ -4057,6 +4142,9 @@ static bool sinkRescaleQuantizedNode(Function *F,
                                     CN->getResult().getType(), CN->getKernels(),
                                     CN->getStrides(), CN->getPads(),
                                     CN->getGroup(), CN->getDilation());
+        newCN->setFusedActivation(CN->getFusedActivation());
+        newCN->setFusedActivationArgs(CN->getFusedActivationArgs());
+
         CN->getResult().replaceAllUsesOfWith(newCN);
         changed = true;
       }
@@ -4846,26 +4934,40 @@ template <class T> bool fuseActivation(T *N, Function *F, const Backend *B) {
     return false;
   }
 
-  FusedActivation activationType;
   NodeValue activationNV;
   switch (activation->getKind()) {
   case Kinded::Kind::ReluNodeKind:
-    activationType = FusedActivation::RELU;
     activationNV = cast<ReluNode>(activation)->getResult();
+    N->setFusedActivation(FusedActivation::RELU);
+    break;
+  case Kinded::Kind::ClipNodeKind:
+    activationNV = cast<ClipNode>(activation)->getResult();
+    N->setFusedActivation(FusedActivation::CLIP);
+    N->setFusedActivationArgs({cast<ClipNode>(activation)->getMin(),
+                               cast<ClipNode>(activation)->getMax()});
     break;
   case Kinded::Kind::SigmoidNodeKind:
-    activationType = FusedActivation::SIGMOID;
     activationNV = cast<SigmoidNode>(activation)->getResult();
+    N->setFusedActivation(FusedActivation::SIGMOID);
     break;
   case Kinded::Kind::TanhNodeKind:
-    activationType = FusedActivation::TANH;
     activationNV = cast<TanhNode>(activation)->getResult();
+    N->setFusedActivation(FusedActivation::TANH);
+    break;
+  case Kinded::Kind::LeakyReluNodeKind:
+    activationNV = cast<LeakyReluNode>(activation)->getResult();
+    N->setFusedActivation(FusedActivation::LEAKY_RELU);
+    N->setFusedActivationArgs({cast<LeakyReluNode>(activation)->getAlpha()});
     break;
   default:
     return false;
   }
 
-  N->setFusedActivation(activationType);
+  // Modify the node output type to that of the activation.
+  if (!(activationNV.getType()->isEqual(N->getResult().getType()))) {
+    N->getResult().setType(activationNV.getType());
+  }
+
   activationNV.replaceAllUsesOfWith(N->getResult());
   return true;
 }
@@ -5193,6 +5295,10 @@ Error glow::optimizeFunction(Function *F, const Backend &B,
   // Transform given precision mode; may quantize, convert to fp16, or
   // instrument with profiling nodes. This must be done after lowering.
   transformForPrecisionMode(B, F, cctx);
+
+  // Optimize the quantized graph because quantization nodes should be optimized
+  // before folding Activation into Conv.
+  ::glow::optimize(F, cctx);
 
   // Fold activations before lowering to enable cases which would not fuse after
   // lowering. This concerns particularly convolution&relu since relu will be

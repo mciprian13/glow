@@ -41,6 +41,11 @@ static Node *optimizeCPUConv(ConvolutionNode *CN, Function *F) {
   return nullptr;
   // ================================================================
 
+  // Fused activation not supported for this optimization.
+  if (CN->hasFusedActivation()) {
+    return nullptr;
+  }
+
   // Make sure that the depth group is divisible by 64 to perform the
   // transformation. This transformation is currently only profitable on
   // low-channel convolutions.

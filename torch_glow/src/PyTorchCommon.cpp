@@ -42,6 +42,7 @@ DEFINE_bool(saturateHost, false, "See PyTorchLoaderSettings");
 
 DEFINE_int32(torch_glow_min_fusion_group_size, 1,
              "Minimum number of nodes in the glow fusion group");
+DEFINE_bool(printJITIndex, false, "Enable printing of jit node indexes");
 DEFINE_bool(dumpGlowDag, false, "See PyTorchLoaderSettings");
 DEFINE_bool(jitVsGlowCompare, false, "Enable per-group error check");
 DEFINE_bool(dumpFinalGlowGraph, false, "See PyTorchLoaderSettings");
@@ -157,6 +158,7 @@ c10::ScalarType elemKindToScalarType(glow::ElemKind ty) {
   case ElemKind::UInt8FusedQTy:
   case ElemKind::UInt8FusedFP16QTy:
   case ElemKind::UInt4FusedFP16QTy:
+  case ElemKind::UInt4FusedQTy:
   case ElemKind::UInt8QTy:
   case ElemKind::Int16QTy:
   case ElemKind::Int32QTy:
@@ -237,6 +239,7 @@ void PyTorchLoaderSettings::initSettings() {
   minFusionGroupSize = FLAGS_torch_glow_min_fusion_group_size;
   dumpGlowDag = FLAGS_dumpGlowDag;
   jitVsGlowCompare = FLAGS_jitVsGlowCompare;
+  printJITIndex = FLAGS_printJITIndex;
   dumpFinalGlowGraph = FLAGS_dumpFinalGlowGraph;
   enableGlowTracing = FLAGS_enableGlowTracing;
   numTracesPerDump = FLAGS_numTracesPerDump;
@@ -687,7 +690,10 @@ void glowAOTFusionWithShapeInference(
           LOG(ERROR) << "Node " << node->kind().toQualString() << " input " << i
                      << " Not found in the shape map!";
         }
-        perGraphInputMeta.emplace_back(itr->second.dtype, itr->second.shape);
+        // Only support tensor input for now
+        // TODO Add support for other input types, e.g., tensor[]
+        perGraphInputMeta.emplace_back(itr->second.dtype,
+                                       itr->second.shape<TensorShape>());
       }
 
       e = runner->warmCache(perGraphInputMeta, runner->getSettings(),

@@ -730,6 +730,8 @@ static size_t getNumDataColumnsFromFused(TypeRef type) {
     return n - 2 * sizeof(float16_t);
   case ElemKind::UInt4FusedFP16QTy:
     return (n - 2 * sizeof(float16_t)) * 2;
+  case ElemKind::UInt4FusedQTy:
+    return (n - 2 * sizeof(float)) * 2;
   default:
     llvm_unreachable("Not supported Fused ElemKind");
   }
@@ -2201,7 +2203,8 @@ bool BBoxTransformNode::verify() const {
   bool isValid = checkTypeIgnoreShape(rois, boxOut, this);
   isValid &= checkSameType(deltas, boxOut, this);
   isValid &= checkTypeIgnoreShape(imInfo, boxOut, this);
-  isValid &= checkType(rois, ElemKind::FloatTy, this);
+  // ROIs can be float32 or float16.
+  isValid &= checkType(rois, {ElemKind::FloatTy, ElemKind::Float16Ty}, this);
   isValid &= expectCompareTrue("Rois must be a 2D tensor", roisDims.size(),
                                size_t(2), this);
   isValid &=
@@ -2366,6 +2369,26 @@ bool GemmNode::verify() const {
   return isValid;
 }
 
+bool LSTMUnitNode::verify() const {
+  bool isValid = true;
+  NodeValue C = getC();
+  auto cDim = C.dims();
+  NodeValue Input = getInput();
+  auto inputDim = Input.dims();
+
+  isValid &=
+      expectCompareTrue("Input must be 2D", inputDim.size(), size_t(2), this);
+  isValid &=
+      expectCompareTrue("Cell State must be 2D", cDim.size(), size_t(2), this);
+  isValid &= expectCompareTrue("Input dims[1] must be 4 * C dims[1]",
+                               inputDim[1], 4 * cDim[1], this);
+  isValid &=
+      expectCompareTrue("Input dims[0] must be must be the same to C dims[0]",
+                        inputDim[0], cDim[0], this);
+
+  return isValid;
+}
+
 bool FullyConnectedNode::verify() const {
   return verifyFullyConnected(getInput(), getWeights(), getBias(), getResult());
 }
@@ -2504,11 +2527,17 @@ llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
   case FusedActivation::RELU:
     os << "RELU";
     break;
+  case FusedActivation::CLIP:
+    os << "CLIP";
+    break;
   case FusedActivation::SIGMOID:
     os << "SIGMOID";
     break;
   case FusedActivation::TANH:
     os << "TANH";
+    break;
+  case FusedActivation::LEAKY_RELU:
+    os << "LEAKY_RELU";
     break;
   }
   return os;

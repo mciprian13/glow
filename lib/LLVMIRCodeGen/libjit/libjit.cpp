@@ -516,7 +516,27 @@ static void libjit_transpose_generic(const T *inW, T *outW, const dim_t *idim,
   const unsigned tileSize = 64;
 
   // Source coordinate.
-  dim_t SC[5];
+  dim_t SC[6];
+
+  if (numDims == 6) {
+    for (dim_t x = 0; x < odim[0]; x++)
+      for (dim_t y = 0; y < odim[1]; y++)
+        for (dim_t z = 0; z < odim[2]; z++)
+          for (dim_t w = 0; w < odim[3]; w++)
+            for (dim_t q = 0; q < odim[4]; q++)
+              for (dim_t r = 0; r < odim[5]; r++) {
+                SC[shuffle[0]] = x;
+                SC[shuffle[1]] = y;
+                SC[shuffle[2]] = z;
+                SC[shuffle[3]] = w;
+                SC[shuffle[4]] = q;
+                SC[shuffle[5]] = r;
+                outW[libjit_getXYZWQR(odim, x, y, z, w, q, r)] =
+                    inW[libjit_getXYZWQR(idim, SC[0], SC[1], SC[2], SC[3],
+                                         SC[4], SC[5])];
+              }
+    return;
+  }
 
   if (numDims == 5) {
     for (dim_t x = 0; x < odim[0]; x++)
@@ -3079,6 +3099,12 @@ void libjit_convertTo_u_i32(int64_t *dstPtr, const int32_t *srcPtr,
                             const dim_t *dims, dim_t numDims) {
   libjit_copy_kernel_with_conversion<int64_t, int32_t>(dstPtr, srcPtr, dims,
                                                        numDims);
+}
+
+void libjit_convertTo_i32_b(int32_t *dstPtr, const bool *srcPtr,
+                            const dim_t *dims, dim_t numDims) {
+  libjit_copy_kernel_with_conversion<int32_t, bool>(dstPtr, srcPtr, dims,
+                                                    numDims);
 }
 
 /// Update min/max values \p compInfo and histogram \p existingHistogram with

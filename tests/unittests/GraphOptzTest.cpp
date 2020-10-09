@@ -2833,8 +2833,10 @@ class MockBackendWithFusion : public MockBackend {
     case Kinded::Kind::ConvolutionNodeKind:
       switch (activation->getKind()) {
       case Kinded::Kind::ReluNodeKind:
+      case Kinded::Kind::ClipNodeKind:
       case Kinded::Kind::SigmoidNodeKind:
       case Kinded::Kind::TanhNodeKind:
+      case Kinded::Kind::LeakyReluNodeKind:
         return true;
       default:
         return false;
@@ -2845,13 +2847,13 @@ class MockBackendWithFusion : public MockBackend {
   }
 };
 
-#define CONV_ACTIVATION_TEST(ACTIVATION_, CREATOR_)                            \
+#define CONV_ACTIVATION_TEST(ACTIVATION_, CREATOR_, ...)                       \
   TEST_F(GraphFold, FoldConv##ACTIVATION_##Activation) {                       \
     auto *A =                                                                  \
         mod_.createPlaceholder(ElemKind::FloatTy, {1, 10, 20, 3}, "A", false); \
     ConvolutionNode *CV =                                                      \
         F_->createConv(bindings_, "conv", A, 16, 5, 1, 2, 1);                  \
-    auto *AN = F_->CREATOR_(#ACTIVATION_, CV);                                 \
+    auto *AN = F_->CREATOR_(__VA_ARGS__);                                      \
     SaveNode *SN = F_->createSave("ret", AN);                                  \
                                                                                \
     EXPECT_EQ(F_->getNodes().size(), 3);                                       \
@@ -2866,9 +2868,11 @@ class MockBackendWithFusion : public MockBackend {
     EXPECT_EQ(fusedCV->getFusedActivation(), FusedActivation::ACTIVATION_);    \
   }
 
-CONV_ACTIVATION_TEST(RELU, createRELU);
-CONV_ACTIVATION_TEST(SIGMOID, createSigmoid);
-CONV_ACTIVATION_TEST(TANH, createTanh);
+CONV_ACTIVATION_TEST(RELU, createRELU, "Relu", CV);
+CONV_ACTIVATION_TEST(CLIP, createClip, "Clip", CV, 0.0, 1.0);
+CONV_ACTIVATION_TEST(SIGMOID, createSigmoid, "Sigmoid", CV);
+CONV_ACTIVATION_TEST(TANH, createTanh, "Tanh", CV);
+CONV_ACTIVATION_TEST(LEAKY_RELU, createLeakyRELU, "LeakyRelu", CV, 1.0);
 
 #undef CONV_ACTIVATION_TEST
 
@@ -5680,6 +5684,69 @@ TEST_F(GraphOptz, EliminateSliceConcatTest) {
   bindings_.allocate(D)->getHandle<float>().randomize(-10.0, 10.0,
                                                       mod_.getPRNG());
   checkNumericalEquivalence();
+}
+
+TEST_F(GraphOptz, EliminateSliceConcatWithReshapeTest) {
+  auto *src =
+      mod_.createPlaceholder(ElemKind::FloatTy, {4, 5, 4}, "src", false);
+  auto *A = F_->createSlice("A", src, {0, 0, 0}, {1, 5, 4});
+  auto *B = F_->createSlice("B", src, {1, 0, 0}, {2, 5, 4});
+  auto *C = F_->createSlice("C", src, {2, 0, 0}, {3, 5, 4});
+  auto *CN1 = F_->createConcat("Concat1", {A, B, C}, 1);
+
+  auto *E = F_->createSlice("E", src, {0, 0, 0}, {4, 5, 1});
+  auto *F = F_->createSlice("F", src, {0, 0, 1}, {4, 5, 2});
+  auto *G = F_->createSlice("G", src, {0, 0, 2}, {4, 5, 3});
+  auto *H = F_->createSlice("H", src, {0, 0, 3}, {4, 5, 4});
+  auto *CN2 = F_->createConcat("Concat2", {E, F, G, H}, 1);
+
+  F_->createSave("save1", CN1);
+  F_->createSave("save2", CN2);
+
+  EXPECT_EQ(F_->getNodes().size(), 11);
+  EXPECT_EQ(countNodeKind(F_, Kinded::Kind::SliceNodeKind), 7);
+  EXPECT_EQ(countNodeKind(F_, Kinded::Kind::ConcatNodeKind), 2);
+
+  optimizedF_ = optimizeFunction(
+      F_, {FunctionPassID::EliminateSliceConcat, getDCEPassConfig()});
+
+  EXPECT_EQ(optimizedF_->getNodes().size(), 9);
+  EXPECT_EQ(countNodeKind(optimizedF_, Kinded::Kind::SliceNodeKind), 2);
+  EXPECT_EQ(countNodeKind(optimizedF_, Kinded::Kind::ConcatNodeKind), 2);
+  EXPECT_EQ(countNodeKind(optimizedF_, Kinded::Kind::ReshapeNodeKind), 2);
+  EXPECT_EQ(countNodeKind(optimizedF_, Kinded::Kind::TransposeNodeKind), 1);
+
+  bindings_.allocate(src)->getHandle<float>().randomize(-10.0, 10.0,
+                                                        mod_.getPRNG());
+  checkNumericalEquivalence(0.f);
+}
+
+/// Test that EliminateSliceConcat makes no optimization when the axis of
+/// concatenation and slicing are not adjacent.
+TEST_F(GraphOptz, EliminateSliceConcatWithReshapeTestNoChange) {
+  auto *src =
+      mod_.createPlaceholder(ElemKind::FloatTy, {4, 5, 4}, "src", false);
+  auto *A = F_->createSlice("A", src, {0, 0, 0}, {1, 5, 4});
+  auto *B = F_->createSlice("B", src, {1, 0, 0}, {2, 5, 4});
+  auto *C = F_->createSlice("C", src, {2, 0, 0}, {3, 5, 4});
+  auto *CN = F_->createConcat("Concat", {A, B, C}, 2);
+
+  F_->createSave("save", CN);
+
+  EXPECT_EQ(F_->getNodes().size(), 5);
+  EXPECT_EQ(countNodeKind(F_, Kinded::Kind::SliceNodeKind), 3);
+  EXPECT_EQ(countNodeKind(F_, Kinded::Kind::ConcatNodeKind), 1);
+
+  optimizedF_ = optimizeFunction(
+      F_, {FunctionPassID::EliminateSliceConcat, getDCEPassConfig()});
+
+  EXPECT_EQ(optimizedF_->getNodes().size(), 5);
+  EXPECT_EQ(countNodeKind(optimizedF_, Kinded::Kind::SliceNodeKind), 3);
+  EXPECT_EQ(countNodeKind(optimizedF_, Kinded::Kind::ConcatNodeKind), 1);
+  EXPECT_EQ(F_->toString(/* skipUsersForStorage */ false,
+                         /* skipName */ true),
+            optimizedF_->toString(/* skipUsersForStorage */ false,
+                                  /* skipName */ true));
 }
 
 /// Verify that when we want to prevent constant folding it doesn't occur.

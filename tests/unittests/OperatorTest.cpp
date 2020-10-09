@@ -1527,20 +1527,22 @@ TEST_P(OperatorTest, FP16RoiAlignRotatedBatchIndexInBoxesTensor) {
       bindings_, mod_, *F_, EE_, ElemKind::Float16Ty, 1E-1);
 }
 
-TEST_P(OperatorTest, BBoxTransform) {
-  CHECK_IF_ENABLED();
-
-  auto *rois = mod_.createPlaceholder(ElemKind::FloatTy, {5, 5}, "rois", false);
-  bindings_.allocate(rois)->getHandle<float>() = {
+template <typename DataType>
+static void testBBoxTransform(PlaceholderBindings &bindings, Module &mod,
+                              Function &F, ExecutionEngine &EE, ElemKind ElemTy,
+                              bool applyScale, bool rotated, bool angleBoundOn,
+                              int64_t angleBoundLo, int64_t angleBoundHi,
+                              float clipAngleThresh, bool legacyPlusOne) {
+  llvm::SmallVector<dim_t, 2> roisDims = {5, 5};
+  llvm::SmallVector<DataType, 25> rois = {
       0., 22.113754, 10.269318, 77.57481,   117.23254,
       0., 89.73806,  46.060974, 125.824005, 96.2649,
       1., 11.121593, 78.21209,  75.711426,  254.73167,
       3., 0.9983631, 352.86606, 248.86679,  367.66916,
       3., 221.1072,  136.93027, 413.82764,  211.13977};
 
-  auto *deltas =
-      mod_.createPlaceholder(ElemKind::FloatTy, {5, 8}, "deltas", false);
-  bindings_.allocate(deltas)->getHandle<float>() = {
+  llvm::SmallVector<dim_t, 2> deltasDims = {5, 8};
+  llvm::SmallVector<DataType, 40> deltas = {
       -0.30892685, -0.44120562, 1.7046866,   -0.62745374, 1.1726723,
       -0.52569604, -0.14308402, 0.48242334,  -1.3132329,  -1.5958056,
       -0.81750935, 2.2151427,   -0.73521894, -0.00737088, 2.3750482,
@@ -1550,36 +1552,63 @@ TEST_P(OperatorTest, BBoxTransform) {
       1.3996177,   -1.3575566,  0.6860114,   -0.4028068,  0.15296046,
       -0.22815527, -2.4161322,  -1.8008438,  -0.92949533, 0.19269551};
 
-  auto *imInfo =
-      mod_.createPlaceholder(ElemKind::FloatTy, {4, 3}, "imInfo", false);
-  bindings_.allocate(imInfo)->getHandle<float>() = {
-      159., 159., 1., 328., 328., 1., 466., 466., 1., 414., 414., 1.};
+  llvm::SmallVector<dim_t, 2> imInfoDims = {4, 3};
+  llvm::SmallVector<DataType, 12> imInfo = {159., 159., 1., 328., 328., 1.,
+                                            466., 466., 1., 414., 414., 1.};
 
   std::vector<float> weights = {1.0, 1.0, 1.0, 1.0};
-  auto *BBTN =
-      F_->createBBoxTransform("bboxTransform", rois, deltas, imInfo, weights,
-                              false, false, false, 0, 0, 0, true);
-  auto *save = F_->createSave("save", BBTN->getBoxOut());
-  auto *savePlaceholder = save->getPlaceholder();
-  bindings_.allocate(savePlaceholder);
 
-  EE_.compile(CompilationMode::Infer);
-
-  EE_.run(bindings_);
-
-  auto saveH = bindings_.get(savePlaceholder)->getHandle();
-
-  std::vector<float> expectedValues = {
+  std::vector<DataType> expectedValues = {
       0.0000,   0.0000,   158.0000, 44.4404,  92.0877,  0.0000,   140.0215,
       93.9451,  51.3913,  0.0000,   66.7658,  158.0000, 0.0000,   66.0093,
       158.0000, 75.5617,  0.0000,   327.0000, 71.3890,  327.0000, 0.7150,
       0.0000,   31.3340,  70.6096,  219.7409, 369.7931, 322.4225, 373.4951,
       0.0000,   344.4728, 413.0000, 347.5388, 337.9926, 114.3067, 413.0000,
       173.1735, 0.0000,   0.0000,   0.0000,   83.6907};
+
+  auto *ROIS = mod.createPlaceholder(ElemTy, roisDims, "rois", false);
+  bindings.allocate(ROIS)->getHandle<DataType>() = rois;
+
+  auto *DELTAS = mod.createPlaceholder(ElemTy, deltasDims, "deltas", false);
+  bindings.allocate(DELTAS)->getHandle<DataType>() = deltas;
+
+  auto *IMINFO = mod.createPlaceholder(ElemTy, imInfoDims, "imInfo", false);
+  bindings.allocate(IMINFO)->getHandle<DataType>() = imInfo;
+
+  auto *BBTN = F.createBBoxTransform(
+      "bboxTransform", ROIS, DELTAS, IMINFO, weights, applyScale, rotated,
+      angleBoundOn, angleBoundLo, angleBoundHi, clipAngleThresh, legacyPlusOne);
+
+  auto *save = F.createSave("save", BBTN->getBoxOut());
+  auto *savePlaceholder = save->getPlaceholder();
+  bindings.allocate(savePlaceholder);
+
+  EE.compile(CompilationMode::Infer);
+
+  EE.run(bindings);
+
+  auto saveH = bindings.get(savePlaceholder)->getHandle<DataType>();
+  float maxDiff = 0.0f;
   for (dim_t i = 0; i < expectedValues.size(); i++) {
-    EXPECT_NEAR(saveH.raw(i), expectedValues[i], 1E-4);
+    EXPECT_NEAR(saveH.raw(i), expectedValues[i], 1);
+    maxDiff =
+        std::max(maxDiff, std::abs((float)(saveH.raw(i) - expectedValues[i])));
   }
+  std::cout << "Max diff: " << maxDiff << std::endl;
 }
+#if NNPI_MAJOR_VERSION >= 1 && NNPI_MINOR_VERSION >= 1
+TEST_P(OperatorTest, BBoxTransform_Float) {
+  CHECK_IF_ENABLED();
+  testBBoxTransform<float>(bindings_, mod_, *F_, EE_, ElemKind::FloatTy, false,
+                           false, false, 0, 0, 0, true);
+}
+
+TEST_P(OperatorTest, BBoxTransform_Float16) {
+  CHECK_IF_ENABLED();
+  testBBoxTransform<float16_t>(bindings_, mod_, *F_, EE_, ElemKind::Float16Ty,
+                               false, false, false, 0, 0, 0, true);
+}
+#endif // NNPI >= 1.1
 
 // Helper to test SpaceToDepth using \p DTy.
 template <typename DataType>
@@ -2235,6 +2264,71 @@ TEST_P(OperatorTest, replaceNaN_Float16) {
 TEST_P(OperatorTest, replaceNaN_BFloat16) {
   CHECK_IF_ENABLED();
   testReplaceNaN<bfloat16_t>(bindings_, mod_, F_, EE_, ElemKind::BFloat16Ty);
+}
+
+/// Reference ideal sigmoid implementation. Computes an fp32 sigmoid
+/// and casts the result to FP16.
+static float16_t refSigmoidFp16(float x) {
+  float res = 1 / (1 + exp(-x));
+
+  return (float16_t)res;
+}
+
+/// Reference ideal sigmoid implementation. Computes an fp32 sigmoid
+/// and casts the result to BFloat16.
+static bfloat16_t refSigmoidBFloat16(float x) {
+  float res = 1 / (1 + exp(-x));
+
+  return (bfloat16_t)res;
+}
+
+TEST_P(OperatorTest, LSTMUnitFP16) {
+  CHECK_IF_ENABLED();
+
+  unsigned minibatchSize = 2;
+  unsigned hiddenSize = 4;
+
+  // Input
+  auto *Input = mod_.createPlaceholder(
+      ElemKind::Float16Ty, {minibatchSize, 4 * hiddenSize}, "Input", false);
+  auto InputH = bindings_.allocate(Input)->getHandle<float16_t>();
+  for (unsigned i = 0; i < minibatchSize; i++) {
+    for (unsigned j = 0; j < hiddenSize * 4; j++) {
+      InputH.at({i, j}) = i * hiddenSize + (j % hiddenSize) + j / hiddenSize;
+    }
+  }
+
+  // Cell State
+  auto *C = mod_.createPlaceholder(ElemKind::Float16Ty,
+                                   {minibatchSize, hiddenSize}, "C", false);
+  auto CH = bindings_.allocate(C)->getHandle<float16_t>();
+  for (unsigned i = 0; i < minibatchSize * hiddenSize; i++) {
+    CH.raw(i) = i;
+  }
+
+  auto lstmUnitNode = F_->createLSTMUnit("lstm_unit", Input, C);
+
+  auto hRes = lstmUnitNode->getNthResult(0);
+  auto cRes = lstmUnitNode->getNthResult(1);
+
+  auto *hSave = F_->createSave("saveH", hRes);
+  auto *hTensor = bindings_.allocate(hSave->getPlaceholder());
+  auto *cSave = F_->createSave("saveC", cRes);
+  auto *cTensor = bindings_.allocate(cSave->getPlaceholder());
+
+  EE_.compile(CompilationMode::Infer);
+  EE_.run(bindings_);
+
+  auto hHandle = hTensor->getHandle<float16_t>();
+  auto cHandle = cTensor->getHandle<float16_t>();
+
+  for (dim_t i = 0; i < 8; i++) {
+    float cExpect = (float16_t)i * refSigmoidFp16(i + 1) +
+                    refSigmoidFp16(i) * (float16_t)std::tanh(i + 2);
+    float hExpect = (float16_t)std::tanh(cExpect) * refSigmoidFp16(i + 3);
+    EXPECT_NEAR(hHandle.raw(i), hExpect, 1E-5);
+    EXPECT_NEAR(cHandle.raw(i), cExpect, 1E-5);
+  }
 }
 
 TEST_P(OperatorTest, log) {
@@ -4932,6 +5026,26 @@ TEST_P(OperatorTest, BoolTranspose2Dims) {
 
   Tensor dest(ElemKind::BoolTy, {13, 20});
   bindings_.get(A)->transpose(&dest, {1, 0});
+  EXPECT_TRUE(bindings_.get(result->getPlaceholder())->isEqual(dest));
+}
+
+/// Check that transpose is supported for 6 dimensions.
+TEST_P(OperatorTest, Transpose6Dims) {
+  CHECK_IF_ENABLED();
+
+  auto *A =
+      mod_.createPlaceholder(ElemKind::FloatTy, {1, 2, 2, 2, 3, 3}, "A", false);
+  bindings_.allocate(A)->getHandle().randomize(0, 100, mod_.getPRNG());
+
+  auto *tr = F_->createTranspose("tr", A, {0, 3, 4, 1, 5, 2});
+  auto *result = F_->createSave("saveTranspose", tr);
+  bindings_.allocate(result->getPlaceholder());
+
+  EE_.compile(CompilationMode::Infer);
+  EE_.run(bindings_);
+
+  Tensor dest(ElemKind::FloatTy, {1, 2, 2, 2, 3, 3});
+  bindings_.get(A)->transpose(&dest, {0, 3, 4, 1, 5, 2});
   EXPECT_TRUE(bindings_.get(result->getPlaceholder())->isEqual(dest));
 }
 
@@ -8403,7 +8517,69 @@ TEST_P(OperatorTest, Relu_Int8) {
   }
 }
 
-// Test for elementwise add with quantization and broadcast support
+// Test for elementwise FloorDiv with quantization and Broadcast
+TEST_P(OperatorTest, IntFloorDivBroadcast) {
+  CHECK_IF_ENABLED();
+
+  const float in1Scale = 0.9;
+  const float in2Scale = 1.2;
+  const float outScale = 1;
+  const int32_t in1Offset = 2;
+  const int32_t in2Offset = -11;
+  const int32_t outOffset = -2;
+  const dim_t N = 2;
+  const dim_t C = 3;
+  const dim_t H = 4;
+  const dim_t W = 5;
+
+  auto in1Ty =
+      mod_.uniqueType(ElemKind::Int8QTy, {N, C, H, W}, in1Scale, in1Offset);
+  auto in2Ty = mod_.uniqueType(ElemKind::Int8QTy, {W}, in2Scale, in2Offset);
+  auto outTy =
+      mod_.uniqueType(ElemKind::Int8QTy, {N, C, H, W}, outScale, outOffset);
+
+  auto *in1 = mod_.createPlaceholder(in1Ty, "in1", false);
+  auto *in2 = mod_.createPlaceholder(in2Ty, "in2", false);
+
+  bindings_.allocate(in1)->getHandle<int8_t>().randomize(-10, 10,
+                                                         mod_.getPRNG());
+  bindings_.allocate(in2)->getHandle<int8_t>().randomize(-10, 10,
+                                                         mod_.getPRNG());
+  constexpr int axis = -1;
+  auto *floorDivBroadcast = F_->createNodeWithBroadcastOutTy<FloorDivNode>(
+      "floorDivBroadcast", axis, outTy, in1, in2);
+
+  auto *saveFloorDiv = F_->createSave("saveFloorDiv", floorDivBroadcast);
+
+  bindings_.allocate(saveFloorDiv->getPlaceholder());
+
+  auto Qin1H = bindings_.get(in1)->getHandle<int8_t>();
+  auto Qin2H = bindings_.get(in2)->getHandle<int8_t>();
+
+  EE_.compile(CompilationMode::Infer);
+  EE_.run(bindings_);
+
+  auto resultFloorDiv =
+      bindings_.get(saveFloorDiv->getPlaceholder())->getHandle<int8_t>();
+
+  for (dim_t w = 0; w < W; w++) {
+    float b = quantization::dequantize(Qin2H.at({w}), {in2Scale, in2Offset});
+    for (dim_t n = 0; n < N; n++) {
+      for (dim_t c = 0; c < C; c++) {
+        for (dim_t h = 0; h < H; h++) {
+          float a = quantization::dequantize(Qin1H.at({n, c, h, w}),
+                                             {in1Scale, in1Offset});
+          int8_t floorDiv =
+              quantization::quantize(std::floor(a / b), {outScale, outOffset});
+
+          EXPECT_NEAR(floorDiv, resultFloorDiv.at({n, c, h, w}), 1);
+        }
+      }
+    }
+  }
+}
+
+// Test for elementwise ope with quantization and broadcast support
 TEST_P(OperatorTest, IntElementWiseBroadcast) {
   CHECK_IF_ENABLED();
 
@@ -8444,15 +8620,25 @@ TEST_P(OperatorTest, IntElementWiseBroadcast) {
   auto *divBroadcast = F_->createNodeWithBroadcastOutTy<DivNode>(
       "divBroadcast", axis, outTy, in1, in2);
 
+  auto *minBroadcast = F_->createNodeWithBroadcastOutTy<MinNode>(
+      "minBroadcast", axis, outTy, in1, in2);
+
+  auto *maxBroadcast = F_->createNodeWithBroadcastOutTy<MaxNode>(
+      "maxBroadcast", axis, outTy, in1, in2);
+
   auto *saveAdd = F_->createSave("saveAdd", addBroadcast);
   auto *saveSub = F_->createSave("saveSub", subBroadcast);
   auto *saveMul = F_->createSave("saveMul", mulBroadcast);
   auto *saveDiv = F_->createSave("saveDiv", divBroadcast);
+  auto *saveMin = F_->createSave("saveMin", minBroadcast);
+  auto *saveMax = F_->createSave("saveMax", maxBroadcast);
 
   bindings_.allocate(saveAdd->getPlaceholder());
   bindings_.allocate(saveSub->getPlaceholder());
   bindings_.allocate(saveMul->getPlaceholder());
   bindings_.allocate(saveDiv->getPlaceholder());
+  bindings_.allocate(saveMin->getPlaceholder());
+  bindings_.allocate(saveMax->getPlaceholder());
 
   auto Qin1H = bindings_.get(in1)->getHandle<int8_t>();
   auto Qin2H = bindings_.get(in2)->getHandle<int8_t>();
@@ -8468,6 +8654,10 @@ TEST_P(OperatorTest, IntElementWiseBroadcast) {
       bindings_.get(saveMul->getPlaceholder())->getHandle<int8_t>();
   auto resultDiv =
       bindings_.get(saveDiv->getPlaceholder())->getHandle<int8_t>();
+  auto resultMin =
+      bindings_.get(saveMin->getPlaceholder())->getHandle<int8_t>();
+  auto resultMax =
+      bindings_.get(saveMax->getPlaceholder())->getHandle<int8_t>();
 
   for (dim_t w = 0; w < W; w++) {
     float b = quantization::dequantize(Qin2H.at({w}), {in2Scale, in2Offset});
@@ -8480,10 +8670,17 @@ TEST_P(OperatorTest, IntElementWiseBroadcast) {
           int8_t sub = quantization::quantize((a - b), {outScale, outOffset});
           int8_t mul = quantization::quantize((a * b), {outScale, outOffset});
           int8_t div = quantization::quantize((a / b), {outScale, outOffset});
+          int8_t min =
+              quantization::quantize(std::min(a, b), {outScale, outOffset});
+          int8_t max =
+              quantization::quantize(std::max(a, b), {outScale, outOffset});
+
           EXPECT_NEAR(add, resultAdd.at({n, c, h, w}), 1);
           EXPECT_NEAR(sub, resultSub.at({n, c, h, w}), 1);
           EXPECT_NEAR(mul, resultMul.at({n, c, h, w}), 1);
           EXPECT_NEAR(div, resultDiv.at({n, c, h, w}), 1);
+          EXPECT_NEAR(min, resultMin.at({n, c, h, w}), 1);
+          EXPECT_NEAR(max, resultMax.at({n, c, h, w}), 1);
         }
       }
     }
@@ -10358,22 +10555,6 @@ COMPARE_UNARY_OP_FUN(Log, 1000, 1.0F, 100.0F)
 COMPARE_UNARY_OP_FUN(Sigmoid, 10, -10.0F, 10.0F)
 #undef COMPARE_UNARY_OP_FUN
 
-/// Reference ideal sigmoid implementation. Computes an fp32 sigmoid
-/// and casts the result to FP16.
-static float16_t refSigmoidFp16(float x) {
-  float res = 1 / (1 + exp(-x));
-
-  return (float16_t)res;
-}
-
-/// Reference ideal sigmoid implementation. Computes an fp32 sigmoid
-/// and casts the result to BFloat16.
-static bfloat16_t refSigmoidBFloat16(float x) {
-  float res = 1 / (1 + exp(-x));
-
-  return (bfloat16_t)res;
-}
-
 /// Test to verify that the sigmoid implementation is equal to the
 /// Mirrored LUT implementation
 /// Does a sweep of -15,15 and prints the outputs of the NNPI implementation
@@ -11191,6 +11372,87 @@ TEST_P(OperatorTest, NonSquareStrideConvolution) {
   for (size_t i = 0; i < 4; i++)
     EXPECT_EQ(result.getHandle().raw(i), ref[i]);
 }
+
+/// Create a Conv2D network with an activation.
+template <FusedActivation ActType>
+static FunctionTensorPair
+createAndInitConv2DWithActivation(glow::PlaceholderBindings &bindings,
+                                  glow::ExecutionEngine &EE) {
+  auto &mod = EE.getModule();
+  Function *F = mod.createFunction("main");
+
+  // Conv2D parameters.
+  std::vector<dim_t> inputDims = {1, 8, 9, 1};
+  std::vector<dim_t> filterDims = {1, 2, 3, 1};
+  std::vector<dim_t> biasDims = {1};
+  std::vector<dim_t> outputDims = {1, 11, 10, 1};
+  std::vector<unsigned_t> kernels = {2, 3};
+  std::vector<unsigned_t> strides = {1, 1};
+  std::vector<unsigned_t> pads = {2, 1, 3, 4};
+  dim_t group = 1;
+  dim_t dilation = 2;
+
+  // Create input placeholder.
+  auto *input =
+      mod.createPlaceholder(ElemKind::FloatTy, inputDims, "input", false);
+  bindings.allocate(input)->getHandle<float>().randomize(-1.0, 1.0,
+                                                         mod.getPRNG());
+  // Create filter constant.
+  auto *filter = mod.createConstant(ElemKind::FloatTy, filterDims, "filter");
+  filter->getPayloadMutable().getHandle<float>().randomize(-1.0, 1.0,
+                                                           mod.getPRNG());
+  // Create bias constant.
+  auto *bias = mod.createConstant(ElemKind::FloatTy, biasDims, "bias");
+  bias->getPayloadMutable().getHandle<float>().randomize(-1.0, 1.0,
+                                                         mod.getPRNG());
+  // Create Conv2D.
+  auto *outTy = mod.uniqueType(ElemKind::FloatTy, outputDims);
+  ConvolutionNode *conv =
+      F->createConv("conv", input, filter, bias, outTy, kernels, strides, pads,
+                    group, dilation);
+  // Create activation.
+  NodeValue act;
+  if (ActType == FusedActivation::RELU) {
+    act = F->createRELU("relu", conv);
+  } else if (ActType == FusedActivation::CLIP) {
+    act = F->createClip("clip", conv, 0.0, 1.0);
+  } else if (ActType == FusedActivation::TANH) {
+    act = F->createTanh("tanh", conv);
+  } else if (ActType == FusedActivation::SIGMOID) {
+    act = F->createSigmoid("sigmoid", conv);
+  } else if (ActType == FusedActivation::LEAKY_RELU) {
+    act = F->createLeakyRELU("leakyrelu", conv, 0.1);
+  }
+
+  SaveNode *save = F->createSave("save", act);
+  auto *resultTensor = bindings.allocate(save->getPlaceholder());
+  return std::make_pair(F, resultTensor);
+}
+
+/// Check that Conv2D followed by activation works (whether fused or not).
+/// For this we compare with the Interpreter reference float implementation.
+#define TEST_CONV2D_ACTIVATION(ACTIVATION, TYPE, TOL)                          \
+  TEST_P(OperatorStatelessTest, Conv2D_##ACTIVATION##_##TYPE) {                \
+    ENABLED_BACKENDS("CPU");                                                   \
+    compareAgainstInterpreter(                                                 \
+        getBackendName(),                                                      \
+        createAndInitConv2DWithActivation<FusedActivation::ACTIVATION>,        \
+        ElemKind::FloatTy, ElemKind::TYPE, TOL);                               \
+  }
+
+TEST_CONV2D_ACTIVATION(RELU, FloatTy, 1e-5)
+TEST_CONV2D_ACTIVATION(CLIP, FloatTy, 1e-5)
+TEST_CONV2D_ACTIVATION(TANH, FloatTy, 1e-5)
+TEST_CONV2D_ACTIVATION(SIGMOID, FloatTy, 1e-5)
+TEST_CONV2D_ACTIVATION(LEAKY_RELU, FloatTy, 1e-5)
+
+TEST_CONV2D_ACTIVATION(RELU, Int8QTy, 0.01)
+TEST_CONV2D_ACTIVATION(CLIP, Int8QTy, 0.01)
+TEST_CONV2D_ACTIVATION(TANH, Int8QTy, 0.02)
+TEST_CONV2D_ACTIVATION(SIGMOID, Int8QTy, 0.01)
+TEST_CONV2D_ACTIVATION(LEAKY_RELU, Int8QTy, 0.01)
+
+#undef TEST_CONV2D_ACTIVATION
 
 /// Check Non-cubic stride for conv3D.
 TEST_P(OperatorTest, NonCubicStrideConv3D) {
@@ -16098,6 +16360,7 @@ TEST_CONVERT_TO(int64_t, int64_t, Int64ITy, Int64ITy)
 TEST_CONVERT_TO(bool, float, BoolTy, FloatTy)
 TEST_CONVERT_TO(bool, float16_t, BoolTy, Float16Ty)
 TEST_CONVERT_TO(bool, bfloat16_t, BoolTy, BFloat16Ty)
+TEST_CONVERT_TO(bool, int32_t, BoolTy, Int32ITy)
 
 #undef TEST_CONVERT_TO
 

@@ -1383,6 +1383,7 @@ Error TFLiteModelLoader::loadPool2D(const tflite::Operator *op,
   auto opCode = opInfo.code;
   NodeValue output;
   if (opCode == tflite::BuiltinOperator_AVERAGE_POOL_2D) {
+    // TFLite AvgPool does NOT include padded regions when normalizing.
     auto *node = F_->createAvgPool(opInfo.name, input, kernels, strides, pads,
                                    ConvolutionLayout::NHWC,
                                    /* countIncludePads */ false);
