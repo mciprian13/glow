@@ -164,7 +164,8 @@ void libjit_quantized_conv2d_generic(
     const dim_t *strides, const dim_t *pads, dim_t group, int32_t outOffset,
     int32_t inOffset, int32_t filterOffset, int32_t biasOffset, int32_t biasPre,
     int32_t biasPost, int32_t biasScale, int32_t outPre, int32_t outPost,
-    int32_t outScale, unsigned depthUnroll, dim_t dilation) {
+    int32_t outScale, unsigned depthUnroll, dim_t dilation, int32_t actType,
+    const int32_t *actArgs) {
 
   dim_t inChannels = inWdims[3];
   dim_t outChannels = outWdims[3];
@@ -239,6 +240,7 @@ void libjit_quantized_conv2d_generic(
 
             // Scale the result back to the expected destination scale.
             int32_t scaledSum = libjit_scale_i32i8(sum, outPre, outPost, outScale, outOffset);
+            scaledSum = libjit_activation_i32(scaledSum, outOffset, actType, actArgs);
             outW[outIdx] = libjit_clip(scaledSum);
 
             // Reset filter pointer for next output height/width.
@@ -612,7 +614,8 @@ void libjit_conv2d_f(float *outW, const float *inW, const float *filterW,
                      const dim_t *inWdims, const dim_t *filterWdims,
                      const dim_t *biasWdims, const dim_t *kernelSizes,
                      const dim_t *strides, const dim_t *pads, dim_t group,
-                     unsigned depthUnroll, dim_t dilation) {
+                     unsigned depthUnroll, dim_t dilation, int32_t actType,
+                     const float *actArgs) {
 
   dim_t inChannels = inWdims[3];
   dim_t outChannels = outWdims[3];
@@ -686,7 +689,7 @@ void libjit_conv2d_f(float *outW, const float *inW, const float *filterW,
             size_t outIdx = o_h * outWdims[2] * outWdims[3] + o_w * outWdims[3] + o_c;
 
             // Write output.
-            outW[outIdx] = sum;
+            outW[outIdx] = libjit_activation_f(sum, actType, actArgs);
 
             // Reset filter pointer for next output height/width.
             filterW -= filterWdims[1] * filterWdims[2] * filterWdims[3];
@@ -725,8 +728,9 @@ void libjit_mat_mul_v1_f(      float *outPtr,
                          const dim_t inpNum,       // Number of input vectors.
                          const dim_t fltNum,       // Number of filter vectors.
                          const dim_t vecLen,       // Vector length.
-                         const dim_t inpNumGrp     // Number of input vector per group.
-                         ) {
+                         const dim_t inpNumGrp,    // Number of input vector per group.
+                         const int32_t actType,
+                         const float *actArgs) {
 
   // Group parameters.
   size_t inpGrp = inpNum / inpNumGrp;
@@ -759,7 +763,7 @@ void libjit_mat_mul_v1_f(      float *outPtr,
           fltPtr -= vecLen;
 
           // Store output.
-          *outPtr = sum;
+          *outPtr = libjit_activation_f(sum, actType, actArgs);
           outPtr += fltNum;
         }
 
@@ -805,7 +809,7 @@ void libjit_mat_mul_v1_f(      float *outPtr,
           fltPtr -= vecLen;
 
           // Store output.
-          *outPtr = sum;
+          *outPtr = libjit_activation_f(sum, actType, actArgs);
           outPtr += fltNum;
         }
 
@@ -847,8 +851,9 @@ void libjit_mat_mul_v2_f(      float *outPtr,
                          const dim_t inpNum,       // Number of input vectors.
                          const dim_t fltNum,       // Number of filter vectors.
                          const dim_t vecLen,       // Vector length.
-                         const dim_t fltNumGrp     // Number of filter vectors per group.
-                         ) {
+                         const dim_t fltNumGrp,    // Number of filter vectors per group.
+                         const int32_t actType,
+                         const float *actArgs) {
 
   // Group parameters.
   size_t fltGrp = fltNum / fltNumGrp;
@@ -879,7 +884,7 @@ void libjit_mat_mul_v2_f(      float *outPtr,
           inpPtr -= vecLen;
 
           // Store output.
-          *outPtr++ = sum;
+          *outPtr++ = libjit_activation_f(sum, actType, actArgs);
         }
 
         // Advance input pointer.
@@ -930,7 +935,7 @@ void libjit_mat_mul_v2_f(      float *outPtr,
           inpPtr -= vecLen;
 
           // Store output.
-          *outPtr++ = sum;
+          *outPtr++ = libjit_activation_f(sum, actType, actArgs);
         }
 
         // Advance input pointer.
@@ -983,7 +988,8 @@ void libjit_conv2d_1x1_v1_f(float *outW, const float *inW, const float *filterW,
                             const dim_t *inWdims, const dim_t *filterWdims,
                             const dim_t *biasWdims, const dim_t *kernelSizes,
                             const dim_t *strides, const dim_t *pads, dim_t group,
-                            unsigned depthUnroll, dim_t dilation) {
+                            unsigned depthUnroll, dim_t dilation, const int32_t actType,
+                            const float *actArgs) {
 
   // Cache optimization.
   // (inpNumGrp+1)*N*4 < cache size where N is vector length
@@ -1004,7 +1010,9 @@ void libjit_conv2d_1x1_v1_f(float *outW, const float *inW, const float *filterW,
                       outWdims[1] * outWdims[2],  // inpNum
                       outWdims[3],                // fltNum
                       inWdims[3],                 // vecLen
-                      depthUnroll                 // inpNumGrp
+                      depthUnroll,                // inpNumGrp
+                      actType,
+                      actArgs
                      );
 }
 
@@ -1024,7 +1032,8 @@ void libjit_conv2d_1x1_v2_f(float *outW, const float *inW, const float *filterW,
                             const dim_t *inWdims, const dim_t *filterWdims,
                             const dim_t *biasWdims, const dim_t *kernelSizes,
                             const dim_t *strides, const dim_t *pads, dim_t group,
-                            unsigned depthUnroll, dim_t dilation) {
+                            unsigned depthUnroll, dim_t dilation, const int32_t actType,
+                            const float *actArgs) {
 
   // Cache optimization.
   // (fltNumGrp+1)*N*4 < cache size where N is vector length
@@ -1045,8 +1054,10 @@ void libjit_conv2d_1x1_v2_f(float *outW, const float *inW, const float *filterW,
                       outWdims[1] * outWdims[2],   // inpNum
                       outWdims[3],                 // fltNum
                       inWdims[3],                  // vecLen
-                      depthUnroll                  // fltNumGrp
-                      );
+                      depthUnroll,                 // fltNumGrp
+                      actType,
+                      actArgs
+                     );
 }
 
 // -----------------------------------------------------------------------------
@@ -1061,7 +1072,8 @@ void libjit_conv2d_dw_f(float *outW, const float *inW, const float *filterW,
                         const dim_t *inWdims, const dim_t *filterWdims,
                         const dim_t *biasWdims, const dim_t *kernelSizes,
                         const dim_t *strides, const dim_t *pads, dim_t group,
-                        unsigned depthUnroll, dim_t dilation) {
+                        unsigned depthUnroll, dim_t dilation, const int32_t actType,
+                        const float *actArgs) {
 
   dim_t padT = pads[0];
   dim_t padL = pads[1];
@@ -1127,7 +1139,7 @@ void libjit_conv2d_dw_f(float *outW, const float *inW, const float *filterW,
           }
 
           // Write output.
-          *outW++ = sum;
+          *outW++ = libjit_activation_f(sum, actType, actArgs);
 
           // Advance pointers for next output channel.
           fltPtr = fltPtrSave + (o_c + 1) * kernelH * kernelW;
