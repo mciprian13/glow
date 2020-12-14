@@ -36,10 +36,56 @@ set(LIBJIT_CPU_COMPILE_OPTIONS
   ${LLVMCPURuntimeExtraFlags}
 )
 
+# LIBJIT CPU specific object files.
+set(LIBJIT_CPU_OBJECT_FILES)
+
+# LIBJIT CPU specific dependencies.
+set(LIBJIT_CPU_DEPENDENCIES)
+
+#===============================================================================
+#                                  ARM Cortex-M
+#===============================================================================
+# ARM CM specific source files.
+list(APPEND ARM_CM_SOURCE_FILES
+  ${CMAKE_CURRENT_SOURCE_DIR}/libjit_cpu/arm_cm/arm_cm.c
+)
+
+# ARM CM compile options.
+set(ARM_CM_COMPILE_OPTIONS
+  -O0
+  -ffast-math
+  -fno-finite-math-only
+  -g0
+)
+
+# Build ARM CM source code to objects using clang without linking. When function
+# returns the ARM_CM_OBJECT_FILES list is defined containing the object files.
+glow_add_libjit(
+  NAME "ARM_CM"
+  SOURCE_FILES ${ARM_CM_SOURCE_FILES}
+  COMPILE_OPTIONS ${ARM_CM_COMPILE_OPTIONS}
+  CLANG_BIN clang
+  OPTION COMPILE_ONLY
+)
+
+# Add object files to CPU list.
+list(APPEND LIBJIT_CPU_OBJECT_FILES
+  ${ARM_CM_OBJECT_FILES}
+)
+
+# Add source files and object files to CPU dependencies.
+list(APPEND LIBJIT_CPU_DEPENDENCIES
+  ${ARM_CM_SOURCE_FILES} ${ARM_CM_OBJECT_FILES}
+)
+
+#===============================================================================
+
 # Add CPU LIBJIT.
 glow_add_libjit(
   NAME "libjit_cpu"
   SOURCE_FILES ${LIBJIT_CPU_SOURCE_FILES}
+  OBJECT_FILES ${LIBJIT_CPU_OBJECT_FILES}
+  DEPENDS ${LIBJIT_CPU_DEPENDENCIES}
   COMPILE_OPTIONS ${LIBJIT_CPU_COMPILE_OPTIONS}
 )
 

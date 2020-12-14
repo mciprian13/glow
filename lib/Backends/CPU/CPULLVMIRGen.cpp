@@ -38,6 +38,160 @@ void CPULLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
   setCurrentDebugLocation(builder, I);
   assert(!canBePartOfDataParallelKernel(I) &&
          "data parallel instructions are not handled here");
+
+  // ===========================================================================
+  //                        ARM Cortex-M Specializations
+  // ===========================================================================
+  auto targetCPU = getTargetMachine().getTargetCPU().str();
+  if (I->getKind() == Kinded::Kind::ConvolutionInstKind &&
+      (targetCPU == "cortex-m4" || targetCPU == "cortex-m7" || targetCPU == "cortex-m33")) {
+    auto *CI = cast<ConvolutionInst>(I);
+    assert(CI->getLayout() == NHWC &&
+           "Glow CPU Backend supports only NHWC Convolutions");
+
+    auto *out = CI->getDest();
+    auto *inp = CI->getSrc();
+    auto *flt = CI->getFilter();
+    auto *bias = CI->getBias();
+
+    auto *outTy = out->getType();
+    auto *inpTy = inp->getType();
+    auto *fltTy = flt->getType();
+    auto *biasTy = bias->getType();
+
+    auto *outPtr = emitValueAddress(builder, out);
+    auto *inpPtr = emitValueAddress(builder, inp);
+    auto *fltPtr = emitValueAddress(builder, flt);
+    auto *biasPtr = emitValueAddress(builder, bias);
+
+    if (inpTy->isQuantizedType()) {
+
+      auto *outOffset = emitConstI32(builder, outTy->getOffset());
+      auto *inpOffset = emitConstI32(builder, inpTy->getOffset());
+      auto *fltOffset = emitConstI32(builder, fltTy->getOffset());
+
+      assert(biasTy->getElementType() == ElemKind::Int32QTy && "Bias precision invalid!");
+      assert(biasTy->getOffset() == 0 && "Bias offset must be 0!");
+      assert(biasTy->getScale() == inpTy->getScale() * fltTy->getScale() && "Bias scale invalid!");
+
+      // Calculate the scaling parameters for the bias and output.
+      float matMulScale = inpTy->getScale() * fltTy->getScale();
+      auto outScaleParam = quantization::quantizeScaleOffset32To8(matMulScale / outTy->getScale(), 0);
+
+      auto *outPre = emitConstI32(builder, outScaleParam.pre);
+      auto *outPost = emitConstI32(builder, outScaleParam.post);
+      auto *outScale = emitConstI32(builder, outScaleParam.scale);
+
+      // ================================= 1x1 Conv =========================================
+      if (CI->getKernels()[0] == 1 && CI->getKernels()[1] == 1) {
+
+#if 0
+        // Integrate input offset into the bias to reduce run-time overhead.
+        Tensor *fltT = getTensorRefForConstantValue(flt);
+        Tensor *biasT = getTensorRefForConstantValue(bias);
+
+        auto fltH = fltT->getHandle<int8_t>();
+        auto biasH = biasT->getHandle<int32_t>();
+
+        for (size_t idxN = 0; idxN < fltTy->dims()[0]; idxN++) {
+          // Compute input offset contribution.
+          int64_t sum = 0;
+          for (size_t idxH = 0; idxH < fltTy->dims()[1]; idxH++) {
+            for (size_t idxW = 0; idxW < fltTy->dims()[2]; idxW++) {
+              for (size_t idxC = 0; idxC < fltTy->dims()[3]; idxC++) {
+                sum += fltH.at({idxN, idxH, idxW, idxC}) - fltTy->getOffset();
+              }
+            }
+          }
+          sum *= -inpTy->getOffset();
+          // Add input offset contribution.
+          biasH.raw(idxN) = biasH.raw(idxN) + sum;
+        }
+#endif
+
+        auto *inpRows = emitConstI32(builder, static_cast<int32_t>(inpTy->dims()[1] * inpTy->dims()[2]));
+        auto *fltRows = emitConstI32(builder, static_cast<int32_t>(fltTy->dims()[0]));
+        auto *numCols = emitConstI32(builder, static_cast<int32_t>(fltTy->dims()[3]));
+
+        auto *F = getFunction("arm_cm_conv2d_1x1_i8xi8");
+
+        createCall(builder, F,
+                   {outPtr,
+                    inpPtr,
+                    fltPtr,
+                    biasPtr,
+                    inpRows,
+                    fltRows,
+                    numCols,
+                    outOffset,
+                    inpOffset,
+                    fltOffset,
+                    outPre,
+                    outPost,
+                    outScale
+                    });
+        std::cout << "Call emitted to arm_cm_conv2d_1x1_i8xi8!\n";
+        return;
+      }
+
+      // ================================= DW Conv =========================================
+      if (CI->getGroup() == inpTy->dims()[3]) {
+
+        auto *outH = emitConstI32(builder, outTy->dims()[1]);
+        auto *outW = emitConstI32(builder, outTy->dims()[2]);
+
+        auto *inpN = emitConstI32(builder, inpTy->dims()[0]);
+        auto *inpH = emitConstI32(builder, inpTy->dims()[1]);
+        auto *inpW = emitConstI32(builder, inpTy->dims()[2]);
+        auto *inpC = emitConstI32(builder, inpTy->dims()[3]);
+
+        auto *kernelH = emitConstI32(builder, CI->getKernels()[0]);
+        auto *kernelW = emitConstI32(builder, CI->getKernels()[1]);
+
+        auto *strideH = emitConstI32(builder, CI->getStrides()[0]);
+        auto *strideW = emitConstI32(builder, CI->getStrides()[1]);
+
+        auto *padT = emitConstI32(builder, CI->getPads()[0]);
+        auto *padL = emitConstI32(builder, CI->getPads()[1]);
+
+        auto *F = getFunction("arm_cm_conv2d_dw_i8xi8");
+
+        createCall(builder, F,
+                   {outPtr,
+                    inpPtr,
+                    fltPtr,
+                    biasPtr,
+
+                    outH,
+                    outW,
+
+                    inpN,
+                    inpH,
+                    inpW,
+                    inpC,
+
+                    kernelH,
+                    kernelW,
+
+                    strideH,
+                    strideW,
+
+                    padT,
+                    padL,
+
+                    outOffset,
+                    inpOffset,
+                    fltOffset,
+                    outPre,
+                    outPost,
+                    outScale
+                    });
+        std::cout << "Call emitted to arm_cm_conv2d_dw_i8xi8!\n";
+        return;
+      }
+    }
+  }
+
   // Perform any backend-specific code generation here and delegate everything
   // else to LLVMIRGen.
   switch (I->getKind()) {
